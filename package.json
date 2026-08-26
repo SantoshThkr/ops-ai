@@ -1,0 +1,22 @@
+{
+  "name": "opsai",
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "packages/shared"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "build:web": "npm --workspace apps/web run build",
+    "lint": "npm run lint:web",
+    "lint:web": "npm --workspace apps/web run lint",
+    "typecheck": "npm run typecheck:web",
+    "typecheck:web": "npm --workspace apps/web run typecheck",
+    "test": "npm run test:web",
+    "test:web": "npm --workspace apps/web run test",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3"
+  }
+}
