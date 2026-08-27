@@ -62,7 +62,8 @@ export default function HomePage() {
     event.preventDefault();
     setError('');
     setSubmitting(true);
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     const payload = {
       email: String(form.get('email') ?? ''),
       password: String(form.get('password') ?? ''),
@@ -74,7 +75,7 @@ export default function HomePage() {
         { method: 'POST', body: JSON.stringify(payload) },
       );
       setUser(result.user);
-      event.currentTarget.reset();
+      formElement.reset();
     } catch (requestError) {
       setError(
         requestError instanceof Error

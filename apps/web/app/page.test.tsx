@@ -41,4 +41,40 @@ describe('HomePage', () => {
     fireEvent.click(screen.getByRole('button', { name: /need an account/i }));
     expect(await screen.findByLabelText('Name')).toBeInTheDocument();
   });
+
+  it('resets the form after successful authentication', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        json: async () => ({}),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          user: {
+            id: 'user-id',
+            email: 'user@example.com',
+            name: 'User',
+            role: 'viewer',
+            active: true,
+          },
+        }),
+      } as Response);
+
+    render(<HomePage />);
+    const email = await screen.findByLabelText('Email');
+    const password = screen.getByLabelText('Password');
+    fireEvent.change(email, { target: { value: 'user@example.com' } });
+    fireEvent.change(password, { target: { value: 'correct horse' } });
+    fireEvent.submit(password.closest('form')!);
+
+    await waitFor(() => {
+      expect(screen.getByText('user@example.com')).toBeInTheDocument();
+    });
+    expect(email).toHaveValue('');
+    expect(password).toHaveValue('');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
 });
