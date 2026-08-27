@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    jwt_secret: str = "development-only-change-this-secret"
+    jwt_expire_minutes: int = 30
+    auth_cookie_name: str = "opsai_access_token"
+    auth_cookie_secure: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", case_sensitive=False)
 

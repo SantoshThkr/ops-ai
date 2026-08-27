@@ -32,6 +32,12 @@ PostgreSQL is the primary database and enables the `pgvector` extension during t
    - API docs: http://localhost:8000/docs
    - API health: http://localhost:8000/health
 
+The API exposes `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, and
+`GET /me`. Registration creates viewer accounts; authenticated role probes are
+available at `/rbac/viewer`, `/rbac/analyst`, and `/rbac/admin`. Login and
+registration set an HTTP-only cookie (and return a bearer token for API clients).
+Set `JWT_SECRET` to a long random value outside local development.
+
 Run migrations locally with:
 
 ```bash
@@ -41,7 +47,7 @@ alembic upgrade head
 
 ## Environment variables
 
-See `.env.example` for the complete local configuration. `NEXT_PUBLIC_API_URL` is exposed to the browser; database and Redis connection strings are backend-only.
+See `.env.example` for the complete local configuration. `NEXT_PUBLIC_API_URL` is exposed to the browser; database, Redis, and JWT settings are backend-only.
 
 ## Development commands
 

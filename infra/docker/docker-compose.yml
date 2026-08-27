@@ -31,6 +31,9 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-opsai}:${POSTGRES_PASSWORD:-opsai_local_password}@postgres:5432/${POSTGRES_DB:-opsai}
       REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-change-this-local-secret}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-30}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
     ports:
       - '8000:8000'
     depends_on:
