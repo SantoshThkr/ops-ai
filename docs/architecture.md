@@ -6,6 +6,14 @@ flowchart LR
     Web --> API[FastAPI API]
     API --> Postgres[(PostgreSQL + pgvector)]
     API --> Redis[(Redis)]
+    API --> Storage[(Local document storage)]
+    Redis --> Worker[Document worker]
+    Worker --> Postgres
+    Worker --> Storage
 ```
 
-The web app owns presentation and browser configuration. The API owns validation, business logic, and persistence access. PostgreSQL is the durable system of record; Redis is a local dependency reserved for asynchronous work and caching. Shared TypeScript contracts remain intentionally small until a cross-application use case exists.
+The web app owns presentation and browser configuration. The API owns validation,
+business logic, and persistence access. PostgreSQL is the durable system of record;
+Redis carries document jobs to the worker, and local storage holds generated-key
+uploads outside the source tree. Shared TypeScript contracts remain intentionally
+small until a cross-application use case exists.

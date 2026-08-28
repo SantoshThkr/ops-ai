@@ -13,6 +13,17 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 30
     auth_cookie_name: str = "opsai_access_token"
     auth_cookie_secure: bool = False
+    storage_dir: str = "storage"
+    max_file_size: int = 10 * 1024 * 1024
+    chunk_size: int = 1000
+    chunk_overlap: int = 100
+    embedding_provider: str = "local"
+    embedding_model: str = "local-hash"
+    embedding_api_key: str | None = None
+    embedding_api_url: str | None = None
+    embedding_dimension: int = 384
+    retrieval_top_k: int = 5
+    queue_name: str = "opsai:document-processing"
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", case_sensitive=False)
 

@@ -34,12 +34,46 @@ services:
       JWT_SECRET: ${JWT_SECRET:-change-this-local-secret}
       JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-30}
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      STORAGE_DIR: ${STORAGE_DIR:-/data/documents}
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-10485760}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-local-hash}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
+      QUEUE_NAME: ${QUEUE_NAME:-opsai:document-processing}
+    volumes:
+      - document_storage:/data/documents
     ports:
       - '8000:8000'
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_started
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-opsai}:${POSTGRES_PASSWORD:-opsai_local_password}@postgres:5432/${POSTGRES_DB:-opsai}
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_DIR: ${STORAGE_DIR:-/data/documents}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-local-hash}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
+      CHUNK_SIZE: ${CHUNK_SIZE:-1000}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
+      QUEUE_NAME: ${QUEUE_NAME:-opsai:document-processing}
+    volumes:
+      - document_storage:/data/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      api:
         condition: service_started
 
   web:
@@ -55,3 +89,4 @@ services:
 
 volumes:
   postgres_data:
+  document_storage:

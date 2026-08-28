@@ -10,7 +10,7 @@ OpsAI is an enterprise AI operations platform. This repository contains the prod
 - `infra/docker`: Dockerfiles and Docker Compose for local services
 - `docs`: architecture and project documentation
 
-PostgreSQL is the primary database and enables the `pgvector` extension during the initial migration. Redis is available for future background work and caching.
+PostgreSQL is the primary database and enables the `pgvector` extension during the initial migration. Redis carries a small document-processing queue, and the worker extracts, chunks, and embeds uploaded files.
 
 ## Local setup
 
@@ -38,12 +38,24 @@ available at `/rbac/viewer`, `/rbac/analyst`, and `/rbac/admin`. Login and
 registration set an HTTP-only cookie (and return a bearer token for API clients).
 Set `JWT_SECRET` to a long random value outside local development.
 
+Document ingestion uses `POST /documents` (PDF, TXT, and Markdown), `GET /documents`
+and `GET /documents/{id}`. `POST /documents/search` performs owner-scoped retrieval
+over completed chunks. The API writes files below `STORAGE_DIR` using generated UUID
+keys; it never uses client filenames as paths. The local embedding provider is
+deterministic and requires no paid API. Set `EMBEDDING_PROVIDER=external`,
+`EMBEDDING_API_URL`, and `EMBEDDING_API_KEY` to use a compatible embedding API.
+Compose starts the separate `worker` service. Run it manually with `python -m app.worker`
+after migrations.
+
 Run migrations locally with:
 
 ```bash
 cd apps/api
 alembic upgrade head
 ```
+
+The document schema is migration `0003_documents_rag`. After starting Compose,
+the API and worker apply migrations automatically.
 
 ## Environment variables
 

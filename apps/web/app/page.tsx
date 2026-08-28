@@ -16,6 +16,16 @@ type AuthResponse = {
   user: User;
 };
 
+type Document = {
+  id: string;
+  filename: string;
+  content_type: string;
+  file_size: number;
+  status: 'uploaded' | 'processing' | 'completed' | 'failed';
+  error_message: string | null;
+  created_at: string;
+};
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
 async function apiRequest<T>(
@@ -26,7 +36,9 @@ async function apiRequest<T>(
     ...options,
     credentials: 'include',
     headers: {
-      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(options.body && !(options.body instanceof FormData)
+        ? { 'Content-Type': 'application/json' }
+        : {}),
       ...options.headers,
     },
   });
@@ -50,6 +62,28 @@ export default function HomePage() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [documents, setDocuments] = useState<Document[]>([]);
+  const [documentsLoading, setDocumentsLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadMessage, setUploadMessage] = useState('');
+
+  async function loadDocuments(showError = true) {
+    setDocumentsLoading(true);
+    try {
+      const result = await apiRequest<{ items: Document[] }>('/documents');
+      setDocuments(result.items);
+    } catch (requestError) {
+      if (showError) {
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : 'Unable to load documents.',
+        );
+      }
+    } finally {
+      setDocumentsLoading(false);
+    }
+  }
 
   useEffect(() => {
     apiRequest<User>('/me')
@@ -57,6 +91,10 @@ export default function HomePage() {
       .catch(() => undefined)
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+      if (user) void loadDocuments(false);
+  }, [user]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -101,6 +139,48 @@ export default function HomePage() {
     }
   }
 
+  async function uploadDocument(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError('');
+    setUploadMessage('');
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    const file = form.get('file');
+    if (!file || typeof file !== 'object' || !('name' in file) || !file.name) {
+      setError('Choose a PDF, TXT, or Markdown file.');
+      return;
+    }
+    const selectedFile = file as File;
+    const extension = selectedFile.name.toLowerCase().split('.').pop();
+    if (!extension || !['pdf', 'txt', 'md', 'markdown'].includes(extension)) {
+      setError('Only PDF, TXT, and Markdown files are supported.');
+      return;
+    }
+    if (selectedFile.size === 0) {
+      setError('The selected file is empty.');
+      return;
+    }
+    if (selectedFile.size > 10 * 1024 * 1024) {
+      setError('The selected file is too large.');
+      return;
+    }
+    setUploading(true);
+    try {
+      await apiRequest<Document>('/documents', { method: 'POST', body: form });
+      setUploadMessage('Upload accepted. Processing will begin shortly.');
+      formElement.reset();
+      await loadDocuments();
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : 'Unable to upload document.',
+      );
+    } finally {
+      setUploading(false);
+    }
+  }
+
   if (loading) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">
@@ -135,7 +215,55 @@ export default function HomePage() {
               {user.role}
             </span>
           </section>
-          {error && <p className="mt-4 text-sm text-rose-400">{error}</p>}
+          <section className="mt-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
+            <h2 className="text-xl font-medium">Documents</h2>
+            <form className="mt-4 flex flex-wrap items-end gap-3" onSubmit={uploadDocument}>
+              <label className="text-sm">
+                Upload a document
+                <input
+                  aria-label="Document file"
+                  className="mt-1 block text-sm text-slate-300"
+                  name="file"
+                  type="file"
+                  accept=".pdf,.txt,.md,.markdown"
+                />
+              </label>
+              <button
+                className="rounded bg-cyan-500 px-4 py-2 font-medium text-slate-950 disabled:opacity-50"
+                disabled={uploading}
+              >
+                {uploading ? 'Uploading…' : 'Upload'}
+              </button>
+            </form>
+            {uploadMessage && <p className="mt-3 text-sm text-emerald-400">{uploadMessage}</p>}
+            {documentsLoading ? (
+              <p className="mt-6 text-sm text-slate-400">Loading documents…</p>
+            ) : documents.length === 0 ? (
+              <p className="mt-6 text-sm text-slate-400">No documents uploaded yet.</p>
+            ) : (
+              <ul className="mt-6 divide-y divide-slate-800">
+                {documents.map((document) => (
+                  <li className="flex flex-wrap items-center justify-between gap-3 py-3" key={document.id}>
+                    <div>
+                      <p className="font-medium">{document.filename}</p>
+                      <p className="text-xs text-slate-400">
+                        {document.content_type} · {(document.file_size / 1024).toFixed(1)} KB ·{' '}
+                        {new Date(document.created_at).toLocaleDateString()}
+                      </p>
+                    </div>
+                    <span className="rounded-full bg-slate-800 px-3 py-1 text-xs capitalize text-cyan-300">
+                      {document.status}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+          {error && (
+            <p className="mt-4 text-sm text-rose-400" role="alert">
+              {error}
+            </p>
+          )}
         </div>
       </main>
     );
