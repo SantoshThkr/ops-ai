@@ -67,7 +67,54 @@ class SearchRequest(BaseModel):
 
 class SearchResult(BaseModel):
     document_id: UUID
+    chunk_id: UUID | None = None
     filename: str
     content: str
     page_number: int | None
     similarity: float
+
+
+class MessageCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)
+
+
+class MessageResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    conversation_id: UUID
+    role: str
+    content: str
+    created_at: datetime
+
+
+class ConversationCreate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class ConversationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    user_id: UUID
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConversationDetailResponse(ConversationResponse):
+    messages: list[MessageResponse] = []
+
+
+class ConversationListResponse(BaseModel):
+    items: list[ConversationResponse]
+    page: int
+    page_size: int
+    total: int
+
+
+class CitationResponse(BaseModel):
+    document_id: UUID
+    filename: str
+    chunk_id: UUID | None = None
+    page_number: int | None = None

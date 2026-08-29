@@ -23,7 +23,11 @@ class Settings(BaseSettings):
     embedding_api_url: str | None = None
     embedding_dimension: int = 384
     retrieval_top_k: int = 5
+    retrieval_similarity_threshold: float = 0.35
     queue_name: str = "opsai:document-processing"
+    chat_provider: str = "local"
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", case_sensitive=False)
 

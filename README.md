@@ -44,6 +44,16 @@ over completed chunks. The API writes files below `STORAGE_DIR` using generated 
 keys; it never uses client filenames as paths. The local embedding provider is
 deterministic and requires no paid API. Set `EMBEDDING_PROVIDER=external`,
 `EMBEDDING_API_URL`, and `EMBEDDING_API_KEY` to use a compatible embedding API.
+
+The chat layer adds authenticated conversations and grounded RAG responses. Use
+`POST /conversations` to create a chat, `GET /conversations` to list owned history,
+and `POST /conversations/{conversation_id}/messages` for streaming responses with
+SSE token/citation/done events. The server only retrieves chunks belonging to the
+current user, keeps a bounded history window, and returns empty-context messaging
+rather than hallucinating answers. Set `CHAT_PROVIDER=openai` and an API key to use
+OpenAI Responses API; otherwise the local deterministic provider is used for tests
+and offline development.
+
 Compose starts the separate `worker` service. Run it manually with `python -m app.worker`
 after migrations.
 

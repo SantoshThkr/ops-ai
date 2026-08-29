@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 from hashlib import sha256
@@ -10,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import bindparam, func, literal_column, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.responses import StreamingResponse
 
 from app.auth import (
     CurrentUser,
@@ -19,15 +21,31 @@ from app.auth import (
     require_roles,
     verify_password,
 )
+from app.chat import get_chat_provider
 from app.config import get_settings
 from app.db import check_database_connection, get_db
 from app.ingestion import embedding_provider, enqueue, storage, validate_upload
-from app.models import Document, DocumentChunk, DocumentStatus, User, UserRole
+from app.models import (
+    Conversation,
+    Document,
+    DocumentChunk,
+    DocumentStatus,
+    Message,
+    User,
+    UserRole,
+)
 from app.schemas import (
     AuthResponse,
+    CitationResponse,
+    ConversationCreate,
+    ConversationDetailResponse,
+    ConversationListResponse,
+    ConversationResponse,
     DocumentListResponse,
     DocumentResponse,
     LoginRequest,
+    MessageCreate,
+    MessageResponse,
     SearchRequest,
     SearchResult,
     UserCreate,
@@ -55,6 +73,44 @@ def _set_auth_cookie(response: Response, token: str) -> None:
         samesite="lax",
         max_age=settings.jwt_expire_minutes * 60,
     )
+
+
+def _conversation_title_from_message(message: str) -> str:
+    cleaned = " ".join(message.strip().split())
+    if not cleaned:
+        return "New conversation"
+    if len(cleaned) <= 40:
+        return cleaned
+    return f"{cleaned[:37]}..."
+
+
+def _event(name: str, payload: dict[str, Any]) -> str:
+    return f"event: {name}\ndata: {json.dumps(payload, default=str)}\n\n"
+
+
+def _deduplicate_by_document_id(chunks: list[SearchResult]) -> list[SearchResult]:
+    seen: set[str] = set()
+    unique: list[SearchResult] = []
+    for chunk in chunks:
+        document_id = str(chunk.document_id)
+        if document_id in seen:
+            continue
+        seen.add(document_id)
+        unique.append(chunk)
+    return unique
+
+
+def _citation_payload(chunks: list[SearchResult]) -> list[CitationResponse]:
+    unique_chunks = _deduplicate_by_document_id(chunks)
+    return [
+        CitationResponse(
+            document_id=chunk.document_id,
+            filename=chunk.filename,
+            chunk_id=chunk.chunk_id,
+            page_number=chunk.page_number,
+        )
+        for chunk in unique_chunks
+    ]
 
 
 @app.get("/health")
@@ -148,6 +204,88 @@ def admin_probe(
     return {"message": "Administrator access granted", "role": user.role.value}
 
 
+@app.post(
+    "/conversations",
+    response_model=ConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_conversation(
+    payload: ConversationCreate,
+    user: CurrentUser,
+    db: Session = Depends(get_db),  # noqa: B008
+) -> Conversation:
+    conversation = Conversation(
+        user_id=user.id,
+        title=payload.title or "New conversation",
+    )
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return conversation
+
+
+@app.get("/conversations", response_model=ConversationListResponse)
+def list_conversations(
+    user: CurrentUser,
+    db: Session = Depends(get_db),  # noqa: B008
+    page: int = Query(default=1, ge=1),  # noqa: B008
+    page_size: int = Query(default=20, ge=1, le=50),  # noqa: B008
+) -> ConversationListResponse:
+    total = (
+        db.scalar(
+            select(func.count()).select_from(Conversation).where(Conversation.user_id == user.id)
+        )
+        or 0
+    )
+    items = db.scalars(
+        select(Conversation)
+        .where(Conversation.user_id == user.id)
+        .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).all()
+    return ConversationListResponse(items=items, page=page, page_size=page_size, total=total)
+
+
+@app.get("/conversations/{conversation_id}", response_model=ConversationDetailResponse)
+def get_conversation(
+    conversation_id: UUID,
+    user: CurrentUser,
+    db: Session = Depends(get_db),  # noqa: B008
+) -> ConversationDetailResponse:
+    conversation = db.scalar(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+        )
+    )
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    messages = db.scalars(
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.asc(), Message.id.asc())
+        .limit(200)
+    ).all()
+    return ConversationDetailResponse(
+        id=conversation.id,
+        user_id=conversation.user_id,
+        title=conversation.title,
+        created_at=conversation.created_at,
+        updated_at=conversation.updated_at,
+        messages=[
+            MessageResponse(
+                id=message.id,
+                conversation_id=message.conversation_id,
+                role=message.role,
+                content=message.content,
+                created_at=message.created_at,
+            )
+            for message in messages
+        ],
+    )
+
+
 @app.post("/documents", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document(
     file: UploadFile = File(...),  # noqa: B008
@@ -222,23 +360,8 @@ def get_document(
     return document
 
 
-def _cosine(left: list[float], right: list[float]) -> float:
-    denominator = math.sqrt(sum(value * value for value in left)) * math.sqrt(
-        sum(value * value for value in right)
-    )
-    return (
-        sum(a * b for a, b in zip(left, right, strict=False)) / denominator if denominator else 0.0
-    )
-
-
-@app.post("/documents/search", response_model=list[SearchResult])
-def search_documents(
-    request: SearchRequest,
-    user: CurrentUser,
-    db: Session = Depends(get_db),  # noqa: B008
-) -> list[SearchResult]:
-    top_k = request.top_k or settings.retrieval_top_k
-    query_vector = embedding_provider(settings).embed([request.query])[0]
+def _search_owned_chunks(db: Session, user: User, query: str, top_k: int) -> list[SearchResult]:
+    query_vector = embedding_provider(settings).embed([query])[0]
     base_query = (
         select(DocumentChunk, Document.filename)
         .join(Document, Document.id == DocumentChunk.document_id)
@@ -263,6 +386,7 @@ def search_documents(
         return [
             SearchResult(
                 document_id=chunk.document_id,
+                chunk_id=chunk.id,
                 filename=filename,
                 content=chunk.content,
                 page_number=chunk.page_number,
@@ -283,6 +407,7 @@ def search_documents(
     return [
         SearchResult(
             document_id=chunk.document_id,
+            chunk_id=chunk.id,
             filename=filename,
             content=chunk.content,
             page_number=chunk.page_number,
@@ -290,3 +415,113 @@ def search_documents(
         )
         for score, chunk, filename in scored[:top_k]
     ]
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    denominator = math.sqrt(sum(value * value for value in left)) * math.sqrt(
+        sum(value * value for value in right)
+    )
+    return (
+        sum(a * b for a, b in zip(left, right, strict=False)) / denominator if denominator else 0.0
+    )
+
+
+@app.post("/documents/search", response_model=list[SearchResult])
+def search_documents(
+    request: SearchRequest,
+    user: CurrentUser,
+    db: Session = Depends(get_db),  # noqa: B008
+) -> list[SearchResult]:
+    top_k = request.top_k or settings.retrieval_top_k
+    return _search_owned_chunks(db, user, request.query, top_k)
+
+
+@app.post("/conversations/{conversation_id}/messages")
+def send_message(
+    conversation_id: UUID,
+    payload: MessageCreate,
+    user: CurrentUser,
+    db: Session = Depends(get_db),  # noqa: B008
+) -> StreamingResponse:
+    conversation = db.scalar(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+        )
+    )
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    user_message = Message(
+        conversation_id=conversation.id,
+        role="user",
+        content=payload.content.strip(),
+    )
+    db.add(user_message)
+    db.commit()
+    db.refresh(user_message)
+    if conversation.title == "New conversation":
+        conversation.title = _conversation_title_from_message(payload.content)
+    conversation.updated_at = func.now()
+    db.commit()
+
+    recent_history = list(
+        db.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation.id)
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(10)
+        ).all()
+    )
+    recent_history.reverse()
+
+    retrieved_chunks = _search_owned_chunks(db, user, payload.content, settings.retrieval_top_k)
+    max_similarity = max((chunk.similarity for chunk in retrieved_chunks), default=0.0)
+    grounded_chunks = (
+        [] if max_similarity < settings.retrieval_similarity_threshold else retrieved_chunks
+    )
+    citations = _citation_payload(grounded_chunks)
+    provider = get_chat_provider(settings)
+
+    def stream_response() -> Any:
+        collected: list[str] = []
+        try:
+            if not retrieved_chunks or max_similarity < settings.retrieval_similarity_threshold:
+                response_text = (
+                    "I couldn't find enough information in your uploaded documents to answer that."
+                )
+                for token in response_text.split():
+                    collected.append(f"{token} ")
+                    yield _event("token", {"text": f"{token} "})
+                assistant_message = Message(
+                    conversation_id=conversation.id,
+                    role="assistant",
+                    content=response_text,
+                )
+                db.add(assistant_message)
+                db.commit()
+                yield _event("done", {"status": "completed"})
+                return
+
+            history_lines = [
+                f"{message.role}: {message.content}" for message in recent_history[-4:]
+            ]
+            for token in provider.stream(payload.content, grounded_chunks, history_lines):
+                collected.append(token)
+                yield _event("token", {"text": token})
+            assistant_message = Message(
+                conversation_id=conversation.id,
+                role="assistant",
+                content="".join(collected).strip(),
+            )
+            db.add(assistant_message)
+            db.commit()
+            citations_payload = [item.model_dump(mode="json") for item in citations]
+            yield _event("citation", {"citations": citations_payload})
+            yield _event("done", {"status": "completed", "citations": citations_payload})
+        except Exception as error:  # pragma: no cover - defensive path
+            logger.exception("Chat generation failed for conversation %s", conversation.id)
+            yield _event("error", {"message": "I couldn't complete that response right now."})
+            raise HTTPException(status_code=500, detail="Chat generation failed") from error
+
+    return StreamingResponse(stream_response(), media_type="text/event-stream")
