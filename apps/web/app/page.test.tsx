@@ -294,7 +294,7 @@ describe('HomePage', () => {
     expect(screen.getByText(/resume.pdf/)).toBeInTheDocument();
   });
 
-  it('renders only one source per document when duplicate citations arrive', async () => {
+  it('renders unique page-level citations from repeated SSE events', async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce({
         ok: true,
@@ -344,8 +344,8 @@ describe('HomePage', () => {
             controller.enqueue(
               new TextEncoder().encode(
                 'event: token\ndata: {"text":"Answer "}\n\n' +
-                  'event: citation\ndata: {"citations":[{"document_id":"doc-1","filename":"resume.pdf","page_number":1},{"document_id":"doc-1","filename":"resume.pdf","page_number":2},{"document_id":"doc-2","filename":"notes.pdf","page_number":1}]}\n\n' +
-                  'event: done\ndata: {"status":"completed","citations":[{"document_id":"doc-1","filename":"resume.pdf","page_number":1},{"document_id":"doc-1","filename":"resume.pdf","page_number":2},{"document_id":"doc-2","filename":"notes.pdf","page_number":1}]}\n\n',
+                  'event: citation\ndata: {"citations":[{"document_id":"doc-1","filename":"31Aug2026.pdf","page_number":1},{"document_id":"doc-2","filename":"27Aug2026.docx.pdf","page_number":1},{"document_id":"doc-2","filename":"27Aug2026.docx.pdf","page_number":2},{"document_id":"doc-1","filename":"31Aug2026.pdf","page_number":2},{"document_id":"doc-1","filename":"31Aug2026.pdf","page_number":1}]}\n\n' +
+                  'event: done\ndata: {"status":"completed","citations":[{"document_id":"doc-1","filename":"31Aug2026.pdf","page_number":1},{"document_id":"doc-2","filename":"27Aug2026.docx.pdf","page_number":1},{"document_id":"doc-2","filename":"27Aug2026.docx.pdf","page_number":2},{"document_id":"doc-1","filename":"31Aug2026.pdf","page_number":2},{"document_id":"doc-1","filename":"31Aug2026.pdf","page_number":1}]}\n\n',
               ),
             );
             controller.close();
@@ -368,8 +368,16 @@ describe('HomePage', () => {
       expect(screen.getByText('Answer')).toBeInTheDocument();
     });
     expect(screen.getByText('Sources')).toBeInTheDocument();
-    expect(screen.getAllByText(/resume.pdf/)).toHaveLength(1);
-    expect(screen.getByText(/notes.pdf/)).toBeInTheDocument();
+    expect(
+      screen.getAllByRole('listitem').map((item) => item.textContent?.replace(/\s+/g, ' ').trim()),
+    ).toEqual([
+      '1. 31Aug2026.pdf — Page 1',
+      '2. 27Aug2026.docx.pdf — Page 1',
+      '3. 27Aug2026.docx.pdf — Page 2',
+      '4. 31Aug2026.pdf — Page 2',
+    ]);
+    expect(screen.getAllByText(/31Aug2026.pdf/)).toHaveLength(2);
+    expect(screen.getAllByText(/27Aug2026.docx.pdf/)).toHaveLength(2);
   });
 
   it('shows the no-context fallback and no sources for weak retrieval', async () => {

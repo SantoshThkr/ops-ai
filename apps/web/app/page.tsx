@@ -42,13 +42,25 @@ type ChatMessage = {
   citations?: Citation[];
 };
 
+function citationIdentity(citation: Citation) {
+  const documentId = citation.document_id;
+  if (citation.page_number !== undefined && citation.page_number !== null) {
+    return `${documentId}:page:${citation.page_number}`;
+  }
+  if (citation.chunk_id) {
+    return `${documentId}:chunk:${citation.chunk_id}`;
+  }
+  return documentId;
+}
+
 function deduplicateCitations(citations: Citation[]) {
   const seen = new Set<string>();
   return citations.filter((citation) => {
-    if (seen.has(citation.document_id)) {
+    const identity = citationIdentity(citation);
+    if (seen.has(identity)) {
       return false;
     }
-    seen.add(citation.document_id);
+    seen.add(identity);
     return true;
   });
 }
@@ -100,7 +112,7 @@ async function streamChatResponse(
   content: string,
   onToken: (text: string) => void,
   onCitation: (citations: Citation[]) => void,
-  onDone: () => void,
+  onDone: (citations: Citation[]) => void,
   onError: (message: string) => void,
 ) {
   const response = await fetch(`${API_URL}/conversations/${conversationId}/messages`, {
@@ -146,10 +158,10 @@ async function streamChatResponse(
           onToken(payload.text ?? '');
           break;
         case 'citation':
-          onCitation(payload.citations ?? []);
+          onCitation(deduplicateCitations(payload.citations ?? []));
           break;
         case 'done':
-          onDone();
+          onDone(deduplicateCitations(payload.citations ?? []));
           break;
         case 'error':
           onError(payload.message ?? 'Unable to stream the response.');
@@ -399,7 +411,15 @@ export default function HomePage() {
             ),
           );
         },
-        () => {
+        (citations) => {
+          const uniqueCitations = deduplicateCitations(citations);
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantMessageId
+                ? { ...message, citations: uniqueCitations }
+                : message,
+            ),
+          );
           setChatSending(false);
           void loadConversations();
         },
@@ -593,7 +613,7 @@ export default function HomePage() {
                               </p>
                               <ol className="space-y-1 pl-5">
                                 {uniqueCitations.map((citation, index) => (
-                                  <li key={`${citation.document_id}-${citation.chunk_id ?? index}`}>
+                                  <li key={citationIdentity(citation)}>
                                     {index + 1}. {citation.filename}
                                     {citation.page_number ? ` — Page ${citation.page_number}` : ''}
                                   </li>

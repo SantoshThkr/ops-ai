@@ -10,14 +10,23 @@ from app.schemas import SearchResult
 logger = logging.getLogger(__name__)
 
 
-def _unique_document_chunks(chunks: Sequence[SearchResult]) -> list[SearchResult]:
-    seen: set[str] = set()
+def _source_key(chunk: SearchResult) -> tuple[str, str]:
+    document_id = str(chunk.document_id)
+    if chunk.page_number is not None:
+        return (document_id, f"page:{chunk.page_number}")
+    if chunk.chunk_id is not None:
+        return (document_id, f"chunk:{chunk.chunk_id}")
+    return (document_id, "default")
+
+
+def canonicalize_sources(chunks: Sequence[SearchResult]) -> list[SearchResult]:
+    seen: set[tuple[str, str]] = set()
     unique: list[SearchResult] = []
     for chunk in chunks:
-        document_id = str(chunk.document_id)
-        if document_id in seen:
+        key = _source_key(chunk)
+        if key in seen:
             continue
-        seen.add(document_id)
+        seen.add(key)
         unique.append(chunk)
     return unique
 
@@ -42,7 +51,7 @@ class LocalChatProvider(BaseChatProvider):
         relevant_chunks: Sequence[SearchResult],
         history: Sequence[str],
     ) -> Iterator[str]:
-        unique_chunks = _unique_document_chunks(relevant_chunks)
+        unique_chunks = canonicalize_sources(relevant_chunks)
         if not unique_chunks:
             answer = "I couldn't find enough information in your uploaded documents to answer that."
             for token in answer.split():
@@ -50,8 +59,16 @@ class LocalChatProvider(BaseChatProvider):
             return
 
         summary = "Based on your uploaded documents: "
+        unique_documents: list[SearchResult] = []
+        seen_documents: set[str] = set()
+        for chunk in unique_chunks:
+            document_key = str(chunk.document_id)
+            if document_key in seen_documents:
+                continue
+            seen_documents.add(document_key)
+            unique_documents.append(chunk)
         references = " ".join(
-            f"{chunk.filename} supports this answer." for chunk in unique_chunks[:2]
+            f"{chunk.filename} supports this answer." for chunk in unique_documents[:2]
         )
         answer = f"{summary}{references}"
         for token in answer.split():
@@ -73,7 +90,7 @@ class OpenAIChatProvider(BaseChatProvider):
             yield from LocalChatProvider(self.settings).stream(question, relevant_chunks, history)
             return
 
-        unique_chunks = _unique_document_chunks(relevant_chunks)
+        unique_chunks = canonicalize_sources(relevant_chunks)
         context_blocks = "\n\n".join(
             (
                 f"Source: {chunk.filename} (page {chunk.page_number or 'unknown'}):"

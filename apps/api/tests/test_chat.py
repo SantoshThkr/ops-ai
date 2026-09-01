@@ -101,7 +101,7 @@ def test_chat_stream_returns_no_context_message_when_nothing_is_retrieved() -> N
         assert "event: done" in body
 
 
-def test_chat_deduplicates_citations_by_document_id(monkeypatch) -> None:
+def test_chat_deduplicates_citations_by_document_and_page(monkeypatch) -> None:
     with build_client() as client:
         client.post(
             "/auth/register",
@@ -119,26 +119,42 @@ def test_chat_deduplicates_citations_by_document_id(monkeypatch) -> None:
                 SearchResult(
                     document_id=document_one,
                     chunk_id=uuid4(),
-                    filename="resume.pdf",
-                    content="Resume summary",
+                    filename="31Aug2026.pdf",
+                    content="First page summary",
                     page_number=1,
+                    similarity=0.96,
+                ),
+                SearchResult(
+                    document_id=document_two,
+                    chunk_id=uuid4(),
+                    filename="27Aug2026.docx.pdf",
+                    content="Second doc first page",
+                    page_number=1,
+                    similarity=0.94,
+                ),
+                SearchResult(
+                    document_id=document_two,
+                    chunk_id=uuid4(),
+                    filename="27Aug2026.docx.pdf",
+                    content="Second doc second page",
+                    page_number=2,
                     similarity=0.92,
                 ),
                 SearchResult(
                     document_id=document_one,
                     chunk_id=uuid4(),
-                    filename="resume.pdf",
-                    content="Resume summary repeated",
+                    filename="31Aug2026.pdf",
+                    content="First doc second page",
                     page_number=2,
-                    similarity=0.88,
+                    similarity=0.90,
                 ),
                 SearchResult(
-                    document_id=document_two,
+                    document_id=document_one,
                     chunk_id=uuid4(),
-                    filename="policy.pdf",
-                    content="Policy content",
-                    page_number=3,
-                    similarity=0.81,
+                    filename="31Aug2026.pdf",
+                    content="Duplicate first page",
+                    page_number=1,
+                    similarity=0.89,
                 ),
             ],
         )
@@ -149,18 +165,21 @@ def test_chat_deduplicates_citations_by_document_id(monkeypatch) -> None:
         )
 
         assert response.status_code == 200
-        citation_events = [
-            event for event in _parse_sse_events(response.text) if event["event"] == "citation"
+        events = _parse_sse_events(response.text)
+        citation_event = next(event for event in events if event["event"] == "citation")
+        done_event = next(event for event in events if event["event"] == "done")
+        citations = citation_event["data"]["citations"]
+        assert citations == done_event["data"]["citations"]
+        assert len(citations) == 4
+        assert [(item["document_id"], item["page_number"]) for item in citations] == [
+            (str(document_one), 1),
+            (str(document_two), 1),
+            (str(document_two), 2),
+            (str(document_one), 2),
         ]
-        assert citation_events
-        citations = citation_events[0]["data"]["citations"]
-        assert len(citations) == 2
-        assert {item["document_id"] for item in citations} == {
-            str(document_one),
-            str(document_two),
-        }
         assert (
-            "resume.pdf supports this answer. resume.pdf supports this answer." not in response.text
+            "31Aug2026.pdf supports this answer. 31Aug2026.pdf supports this answer."
+            not in response.text
         )
 
 

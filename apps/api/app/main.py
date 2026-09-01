@@ -21,7 +21,7 @@ from app.auth import (
     require_roles,
     verify_password,
 )
-from app.chat import get_chat_provider
+from app.chat import canonicalize_sources, get_chat_provider
 from app.config import get_settings
 from app.db import check_database_connection, get_db
 from app.ingestion import embedding_provider, enqueue, storage, validate_upload
@@ -88,20 +88,8 @@ def _event(name: str, payload: dict[str, Any]) -> str:
     return f"event: {name}\ndata: {json.dumps(payload, default=str)}\n\n"
 
 
-def _deduplicate_by_document_id(chunks: list[SearchResult]) -> list[SearchResult]:
-    seen: set[str] = set()
-    unique: list[SearchResult] = []
-    for chunk in chunks:
-        document_id = str(chunk.document_id)
-        if document_id in seen:
-            continue
-        seen.add(document_id)
-        unique.append(chunk)
-    return unique
-
-
 def _citation_payload(chunks: list[SearchResult]) -> list[CitationResponse]:
-    unique_chunks = _deduplicate_by_document_id(chunks)
+    unique_chunks = canonicalize_sources(chunks)
     return [
         CitationResponse(
             document_id=chunk.document_id,
