@@ -35,7 +35,7 @@ PostgreSQL is the primary database and enables the `pgvector` extension during t
 The API exposes `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, and
 `GET /me`. Registration creates viewer accounts; authenticated role probes are
 available at `/rbac/viewer`, `/rbac/analyst`, and `/rbac/admin`. Login and
-registration set an HTTP-only cookie (and return a bearer token for API clients).
+registration set an HTTP-only authentication cookie.
 Set `JWT_SECRET` to a long random value outside local development.
 
 Document ingestion uses `POST /documents` (PDF, TXT, and Markdown), `GET /documents`
@@ -53,6 +53,22 @@ current user, keeps a bounded history window, and returns empty-context messagin
 rather than hallucinating answers. Set `CHAT_PROVIDER=openai` and an API key to use
 OpenAI Responses API; otherwise the local deterministic provider is used for tests
 and offline development.
+
+The local agent uses a typed deterministic intent parser and exposes the
+allowlisted `search_knowledge`, `get_metric`, `get_incident`, and
+`create_incident` tools. Metrics are read-only recorded values (including
+payment failure rate, daily error rate, and transaction count); no metric is
+invented when the database has no observation. Incident creation is proposal
+only: analysts and administrators must approve an unexpired action before the
+single persisted execution boundary can run it. Tool activity is streamed as
+`tool_call`/`tool_result` SSE events; proposals emit `approval_required` and
+never perform an external side effect.
+Analysts and admins can approve and execute actions through `/actions/{id}/approve` and
+`/actions/{id}/execute`; all changes are persisted and visible in `/audit-logs`.
+`GET /metrics` and `POST /metrics/query` are read-only. A dependency-free,
+authenticated JSON-RPC adapter is available at `POST /mcp` for `tools/list` and
+`tools/call` over the same services and authorization rules. Redis rate limiting safely degrades when Redis is
+unavailable.
 
 Compose starts the separate `worker` service. Run it manually with `python -m app.worker`
 after migrations.

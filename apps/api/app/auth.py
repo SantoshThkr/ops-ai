@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
-from app.models import User, UserRole
+from app.models import AuditLog, User, UserRole
 
 password_hash = PasswordHash.recommended()
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -75,8 +75,21 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
 def require_roles(*roles: UserRole) -> Callable[..., User]:
-    def dependency(user: CurrentUser) -> User:
+    def dependency(
+        user: CurrentUser,
+        db: Annotated[Session, Depends(get_db)],
+    ) -> User:
         if user.role not in roles:
+            db.add(
+                AuditLog(
+                    actor_id=user.id,
+                    event="permission.denied",
+                    resource_type="route",
+                    resource_id=None,
+                    details={"required_roles": [role.value for role in roles]},
+                )
+            )
+            db.commit()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have permission to access this resource",

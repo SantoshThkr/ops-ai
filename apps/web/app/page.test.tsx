@@ -260,6 +260,8 @@ describe('HomePage', () => {
               new TextEncoder().encode(
                 'event: token\ndata: {"text":"Hello "}\n\n' +
                   'event: token\ndata: {"text":"world"}\n\n' +
+                  'event: tool_call\ndata: {"name":"search_knowledge"}\n\n' +
+                  'event: tool_result\ndata: {"name":"search_knowledge"}\n\n' +
                   'event: citation\ndata: {"citations":[{"document_id":"doc-1","filename":"resume.pdf","page_number":1}]}\n\n' +
                   'event: done\ndata: {"status":"completed","citations":[{"document_id":"doc-1","filename":"resume.pdf","page_number":1}]}\n\n',
               ),
@@ -292,6 +294,9 @@ describe('HomePage', () => {
     });
     expect(screen.getByText('Sources')).toBeInTheDocument();
     expect(screen.getByText(/resume.pdf/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Tool activity')).toHaveTextContent(
+      'Calling search_knowledge',
+    );
   });
 
   it('renders unique page-level citations from repeated SSE events', async () => {
@@ -378,6 +383,99 @@ describe('HomePage', () => {
     ]);
     expect(screen.getAllByText(/31Aug2026.pdf/)).toHaveLength(2);
     expect(screen.getAllByText(/27Aug2026.docx.pdf/)).toHaveLength(2);
+  });
+
+  it('renders streamed permission errors in the assistant response', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          user: {
+            id: 'user-id',
+            email: 'user@example.com',
+            name: 'User',
+            role: 'viewer',
+            active: true,
+          },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ items: [], page: 1, page_size: 20, total: 0 }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          items: [
+            {
+              id: 'conversation-id',
+              title: 'Incident request',
+              created_at: '2026-08-28T00:00:00Z',
+              updated_at: '2026-08-28T00:00:00Z',
+              user_id: 'user-id',
+            },
+          ],
+          page: 1,
+          page_size: 20,
+          total: 1,
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          id: 'conversation-id',
+          title: 'Incident request',
+          created_at: '2026-08-28T00:00:00Z',
+          updated_at: '2026-08-28T00:00:00Z',
+          user_id: 'user-id',
+          messages: [],
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                'event: tool_call\ndata: {"name":"create_incident"}\n\n' +
+                  'event: tool_result\ndata: {"name":"create_incident","result":{"error":"permission_denied"}}\n\n' +
+                  'event: error\ndata: {"message":"You do not have permission to create incident proposals."}\n\n' +
+                  'event: done\ndata: {"status":"denied"}\n\n',
+              ),
+            );
+            controller.close();
+          },
+        }),
+      } as Response);
+
+    render(<HomePage />);
+    await waitFor(() => {
+      expect(screen.getAllByText('Incident request').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.change(screen.getByLabelText('Chat message'), {
+      target: { value: 'Create an incident for the api service.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText(
+          'You do not have permission to create incident proposals.',
+        ),
+      ).toHaveLength(2);
+    });
+    expect(screen.getByLabelText('Tool activity')).toHaveTextContent(
+      'Calling create_incident',
+    );
+    expect(screen.getByLabelText('Tool activity')).toHaveTextContent(
+      'create_incident completed',
+    );
   });
 
   it('shows the no-context fallback and no sources for weak retrieval', async () => {

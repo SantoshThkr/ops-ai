@@ -167,7 +167,9 @@ class ExternalEmbeddingProvider:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+        with urllib.request.urlopen(  # noqa: S310
+            request, timeout=self.settings.provider_timeout_seconds
+        ) as response:
             body = json.loads(response.read())
         return [item["embedding"] for item in body["data"]]
 

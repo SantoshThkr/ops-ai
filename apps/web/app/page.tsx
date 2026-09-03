@@ -1,6 +1,12 @@
 'use client';
 
-import { FormEvent, KeyboardEvent, useCallback, useEffect, useState } from 'react';
+import {
+  FormEvent,
+  KeyboardEvent,
+  useCallback,
+  useEffect,
+  useState,
+} from 'react';
 import React from 'react';
 import { PRODUCT_NAME } from '@opsai/shared';
 
@@ -40,6 +46,15 @@ type ChatMessage = {
   content: string;
   created_at: string;
   citations?: Citation[];
+  toolActivity?: string[];
+  approval?: ApprovalRequest;
+};
+
+type ApprovalRequest = {
+  action_id: string;
+  incident_id: string;
+  expires_at: string;
+  status?: string;
 };
 
 function citationIdentity(citation: Citation) {
@@ -100,7 +115,10 @@ async function apiRequest<T>(
     const detail =
       typeof body.detail === 'string'
         ? body.detail
-        : body.detail?.map((item) => item.msg).filter(Boolean).join(', ');
+        : body.detail
+            ?.map((item) => item.msg)
+            .filter(Boolean)
+            .join(', ');
     throw new Error(detail || 'Something went wrong. Please try again.');
   }
   if (response.status === 204) return undefined as T;
@@ -114,16 +132,23 @@ async function streamChatResponse(
   onCitation: (citations: Citation[]) => void,
   onDone: (citations: Citation[]) => void,
   onError: (message: string) => void,
+  onToolActivity: (activity: string) => void,
+  onApprovalRequired: (approval: ApprovalRequest) => void,
 ) {
-  const response = await fetch(`${API_URL}/conversations/${conversationId}/messages`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content }),
-  });
+  const response = await fetch(
+    `${API_URL}/conversations/${conversationId}/messages`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    },
+  );
 
   if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as { detail?: string };
+    const body = (await response.json().catch(() => ({}))) as {
+      detail?: string;
+    };
     throw new Error(body.detail ?? 'Unable to send message.');
   }
 
@@ -154,6 +179,15 @@ async function streamChatResponse(
       const payload = JSON.parse(dataLine.replace('data: ', ''));
 
       switch (eventName) {
+        case 'tool_call':
+          onToolActivity(`Calling ${payload.name ?? 'tool'}…`);
+          break;
+        case 'tool_result':
+          onToolActivity(`${payload.name ?? 'Tool'} completed`);
+          break;
+        case 'approval_required':
+          onApprovalRequired(payload as ApprovalRequest);
+          break;
         case 'token':
           onToken(payload.text ?? '');
           break;
@@ -184,10 +218,16 @@ export default function HomePage() {
   const [uploading, setUploading] = useState(false);
   const [uploadMessage, setUploadMessage] = useState('');
   const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<
+    string | null
+  >(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatSending, setChatSending] = useState(false);
+  const [toolActivity, setToolActivity] = useState<string[]>([]);
+  const [approvalRequests, setApprovalRequests] = useState<ApprovalRequest[]>(
+    [],
+  );
 
   async function loadDocuments(showError = true) {
     setDocumentsLoading(true);
@@ -209,7 +249,9 @@ export default function HomePage() {
 
   const loadConversations = useCallback(async () => {
     try {
-      const result = await apiRequest<{ items?: Conversation[] }>('/conversations');
+      const result = await apiRequest<{ items?: Conversation[] }>(
+        '/conversations',
+      );
       const items = result?.items ?? [];
       setConversations(items);
       if (items.length > 0) {
@@ -226,7 +268,9 @@ export default function HomePage() {
 
   async function openConversation(conversationId: string) {
     try {
-      const result = await apiRequest<ConversationDetail | undefined>(`/conversations/${conversationId}`);
+      const result = await apiRequest<ConversationDetail | undefined>(
+        `/conversations/${conversationId}`,
+      );
       setActiveConversationId(conversationId);
       setMessages(result?.messages ?? []);
     } catch (requestError) {
@@ -308,6 +352,8 @@ export default function HomePage() {
       setConversations([]);
       setMessages([]);
       setActiveConversationId(null);
+      setApprovalRequests([]);
+      setToolActivity([]);
     } catch (requestError) {
       setError(
         requestError instanceof Error
@@ -379,14 +425,19 @@ export default function HomePage() {
     setChatInput('');
     setChatSending(true);
     setError('');
-    setMessages((current) => [...current, userMessage, {
-      id: assistantMessageId,
-      conversation_id: currentConversationId,
-      role: 'assistant',
-      content: '',
-      created_at: new Date().toISOString(),
-      citations: [],
-    }]);
+    setToolActivity([]);
+    setMessages((current) => [
+      ...current,
+      userMessage,
+      {
+        id: assistantMessageId,
+        conversation_id: currentConversationId,
+        role: 'assistant',
+        content: '',
+        created_at: new Date().toISOString(),
+        citations: [],
+      },
+    ]);
 
     try {
       await streamChatResponse(
@@ -426,6 +477,27 @@ export default function HomePage() {
         (message) => {
           setChatSending(false);
           setError(message);
+          setMessages((current) =>
+            current.map((item) =>
+              item.id === assistantMessageId
+                ? { ...item, content: message }
+                : item,
+            ),
+          );
+        },
+        (activity) => setToolActivity((current) => [...current, activity]),
+        (approval) => {
+          setApprovalRequests((current) => [
+            ...current.filter((item) => item.action_id !== approval.action_id),
+            approval,
+          ]);
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantMessageId
+                ? { ...message, approval }
+                : message,
+            ),
+          );
         },
       );
     } catch (requestError) {
@@ -486,7 +558,10 @@ export default function HomePage() {
 
           <section className="mt-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
             <h2 className="text-xl font-medium">Documents</h2>
-            <form className="mt-4 flex flex-wrap items-end gap-3" onSubmit={uploadDocument}>
+            <form
+              className="mt-4 flex flex-wrap items-end gap-3"
+              onSubmit={uploadDocument}
+            >
               <label className="text-sm">
                 Upload a document
                 <input
@@ -504,19 +579,27 @@ export default function HomePage() {
                 {uploading ? 'Uploading…' : 'Upload'}
               </button>
             </form>
-            {uploadMessage && <p className="mt-3 text-sm text-emerald-400">{uploadMessage}</p>}
+            {uploadMessage && (
+              <p className="mt-3 text-sm text-emerald-400">{uploadMessage}</p>
+            )}
             {documentsLoading ? (
               <p className="mt-6 text-sm text-slate-400">Loading documents…</p>
             ) : documents.length === 0 ? (
-              <p className="mt-6 text-sm text-slate-400">No documents uploaded yet.</p>
+              <p className="mt-6 text-sm text-slate-400">
+                No documents uploaded yet.
+              </p>
             ) : (
               <ul className="mt-6 divide-y divide-slate-800">
                 {documents.map((document) => (
-                  <li className="flex flex-wrap items-center justify-between gap-3 py-3" key={document.id}>
+                  <li
+                    className="flex flex-wrap items-center justify-between gap-3 py-3"
+                    key={document.id}
+                  >
                     <div>
                       <p className="font-medium">{document.filename}</p>
                       <p className="text-xs text-slate-400">
-                        {document.content_type} · {(document.file_size / 1024).toFixed(1)} KB ·{' '}
+                        {document.content_type} ·{' '}
+                        {(document.file_size / 1024).toFixed(1)} KB ·{' '}
                         {new Date(document.created_at).toLocaleDateString()}
                       </p>
                     </div>
@@ -546,7 +629,9 @@ export default function HomePage() {
               </div>
               <div className="mt-4 space-y-2">
                 {conversations.length === 0 ? (
-                  <p className="text-sm text-slate-400">No conversations yet.</p>
+                  <p className="text-sm text-slate-400">
+                    No conversations yet.
+                  </p>
                 ) : (
                   conversations.map((conversation) => (
                     <button
@@ -561,9 +646,13 @@ export default function HomePage() {
                       }}
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <p className="truncate text-sm font-medium">{conversation.title}</p>
+                        <p className="truncate text-sm font-medium">
+                          {conversation.title}
+                        </p>
                         <span className="text-[10px] uppercase tracking-wide text-slate-400">
-                          {new Date(conversation.updated_at).toLocaleDateString()}
+                          {new Date(
+                            conversation.updated_at,
+                          ).toLocaleDateString()}
                         </span>
                       </div>
                     </button>
@@ -577,7 +666,10 @@ export default function HomePage() {
                 <div className="mb-4 flex items-center justify-between">
                   <h2 className="text-lg font-medium">
                     {activeConversationId
-                      ? conversations.find((conversation) => conversation.id === activeConversationId)?.title ?? 'Conversation'
+                      ? (conversations.find(
+                          (conversation) =>
+                            conversation.id === activeConversationId,
+                        )?.title ?? 'Conversation')
                       : 'Chat'}
                   </h2>
                   {activeConversationId && (
@@ -585,16 +677,36 @@ export default function HomePage() {
                       Live
                     </span>
                   )}
+                  {approvalRequests.length > 0 && (
+                    <span className="text-xs text-amber-300">
+                      {approvalRequests.length} approval pending
+                    </span>
+                  )}
                 </div>
 
                 <div className="flex-1 space-y-4 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950/50 p-4">
+                  {toolActivity.length > 0 && (
+                    <div
+                      className="rounded-lg border border-cyan-900 bg-cyan-950/30 p-3 text-xs text-cyan-200"
+                      aria-label="Tool activity"
+                    >
+                      <p className="mb-1 uppercase tracking-[0.2em]">
+                        Tool activity
+                      </p>
+                      {toolActivity.map((activity, index) => (
+                        <p key={`${activity}-${index}`}>{activity}</p>
+                      ))}
+                    </div>
+                  )}
                   {messages.length === 0 ? (
                     <p className="text-sm text-slate-400">
                       Ask a question about your uploaded documents.
                     </p>
                   ) : (
                     messages.map((message) => {
-                      const uniqueCitations = deduplicateCitations(message.citations ?? []);
+                      const uniqueCitations = deduplicateCitations(
+                        message.citations ?? [],
+                      );
                       return (
                         <div key={message.id} className="space-y-2">
                           <div
@@ -604,7 +716,9 @@ export default function HomePage() {
                                 : 'bg-slate-800 text-slate-100'
                             }`}
                           >
-                            <p className="whitespace-pre-wrap text-sm">{message.content || '…'}</p>
+                            <p className="whitespace-pre-wrap text-sm">
+                              {message.content || '…'}
+                            </p>
                           </div>
                           {uniqueCitations.length > 0 && (
                             <div className="max-w-2xl rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-300">
@@ -615,10 +729,108 @@ export default function HomePage() {
                                 {uniqueCitations.map((citation, index) => (
                                   <li key={citationIdentity(citation)}>
                                     {index + 1}. {citation.filename}
-                                    {citation.page_number ? ` — Page ${citation.page_number}` : ''}
+                                    {citation.page_number
+                                      ? ` — Page ${citation.page_number}`
+                                      : ''}
                                   </li>
                                 ))}
                               </ol>
+                            </div>
+                          )}
+                          {message.approval && (
+                            <div className="max-w-2xl rounded-lg border border-amber-700 bg-amber-950/30 px-3 py-2 text-sm text-amber-200">
+                              {message.approval.status === 'approved'
+                                ? 'Approved. '
+                                : 'Approval required before this action can run. '}
+                              {message.approval.status !== 'approved' &&
+                                message.approval.status !== 'executed' && (
+                                  <button
+                                    className="rounded bg-amber-400 px-2 py-1 text-xs font-medium text-slate-950"
+                                    onClick={async () => {
+                                      try {
+                                        await apiRequest(
+                                          `/actions/${message.approval!.action_id}/approve`,
+                                          {
+                                            method: 'POST',
+                                            headers: {
+                                              'Idempotency-Key': `web-${message.approval!.action_id}`,
+                                            },
+                                            body: JSON.stringify({
+                                              decision: 'approved',
+                                            }),
+                                          },
+                                        );
+                                        setApprovalRequests((current) =>
+                                          current.filter(
+                                            (item) =>
+                                              item.action_id !==
+                                              message.approval!.action_id,
+                                          ),
+                                        );
+                                        setMessages((current) =>
+                                          current.map((item) =>
+                                            item.id === message.id
+                                              ? {
+                                                  ...item,
+                                                  approval: {
+                                                    ...message.approval!,
+                                                    status: 'approved',
+                                                  },
+                                                }
+                                              : item,
+                                          ),
+                                        );
+                                      } catch (requestError) {
+                                        setError(
+                                          requestError instanceof Error
+                                            ? requestError.message
+                                            : 'Unable to approve action.',
+                                        );
+                                      }
+                                    }}
+                                  >
+                                    Approve
+                                  </button>
+                                )}
+                              {message.approval.status === 'approved' && (
+                                <button
+                                  className="ml-2 rounded bg-emerald-400 px-2 py-1 text-xs font-medium text-slate-950"
+                                  onClick={async () => {
+                                    try {
+                                      await apiRequest(
+                                        `/actions/${message.approval!.action_id}/execute`,
+                                        {
+                                          method: 'POST',
+                                          headers: {
+                                            'Idempotency-Key': `web-execute-${message.approval!.action_id}`,
+                                          },
+                                        },
+                                      );
+                                      setMessages((current) =>
+                                        current.map((item) =>
+                                          item.id === message.id
+                                            ? {
+                                                ...item,
+                                                approval: {
+                                                  ...message.approval!,
+                                                  status: 'executed',
+                                                },
+                                              }
+                                            : item,
+                                        ),
+                                      );
+                                    } catch (requestError) {
+                                      setError(
+                                        requestError instanceof Error
+                                          ? requestError.message
+                                          : 'Unable to execute action.',
+                                      );
+                                    }
+                                  }}
+                                >
+                                  Execute
+                                </button>
+                              )}
                             </div>
                           )}
                         </div>
@@ -644,7 +856,11 @@ export default function HomePage() {
                     <button
                       type="submit"
                       className="rounded bg-cyan-500 px-4 py-2 text-sm font-medium text-slate-950 disabled:opacity-50"
-                      disabled={!chatInput.trim() || chatSending || !activeConversationId}
+                      disabled={
+                        !chatInput.trim() ||
+                        chatSending ||
+                        !activeConversationId
+                      }
                     >
                       {chatSending ? 'Sending…' : 'Send'}
                     </button>

@@ -189,7 +189,7 @@ def test_chat_uses_no_context_when_similarity_is_below_threshold(monkeypatch) ->
             "/auth/register",
             json={"email": "lowmatch@example.com", "password": "correct horse", "name": "LowMatch"},
         )
-        conversation = client.post("/conversations", json={"title": "Casual"})
+        conversation = client.post("/conversations", json={"title": "Low match"})
         conversation_id = conversation.json()["id"]
 
         monkeypatch.setattr(
@@ -208,7 +208,7 @@ def test_chat_uses_no_context_when_similarity_is_below_threshold(monkeypatch) ->
 
         response = client.post(
             f"/conversations/{conversation_id}/messages",
-            json={"content": "how are u"},
+            json={"content": "What does the policy say?"},
         )
 
         assert response.status_code == 200

@@ -78,7 +78,11 @@ class LocalChatProvider(BaseChatProvider):
 class OpenAIChatProvider(BaseChatProvider):
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
-        self.client = OpenAI(api_key=settings.openai_api_key or "")
+        self.client = OpenAI(
+            api_key=settings.openai_api_key or "",
+            timeout=settings.provider_timeout_seconds,
+            max_retries=0,
+        )
 
     def stream(
         self,

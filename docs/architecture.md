@@ -17,7 +17,15 @@ flowchart LR
     Retrieval --> Postgres
     API --> LLM[OpenAI Responses API]
     LLM --> Chat
+    API --> Agent[Local deterministic agent]
+    Agent --> Tools[Typed safe tools]
+    API --> Audit[Audit log]
 ```
+
+The local agent uses the same thresholded, owner-scoped retrieval implementation
+and exposes allowlisted knowledge/metric/incident tools. Incident creation is
+proposal-only; actions are persisted with ownership, expiry, approval, audit
+events, and a database-protected one-time execution boundary.
 
 The web app owns presentation and browser configuration. The API owns validation,
 business logic, and persistence access. PostgreSQL is the durable system of record;
