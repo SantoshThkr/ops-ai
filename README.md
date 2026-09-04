@@ -115,4 +115,27 @@ npm run typecheck
 npm run test
 ```
 
+## Evaluation and observability
+
+OpsAI includes a small offline deterministic evaluation suite for knowledge-context
+gating, allowlisted metrics, incident approval and idempotency, MCP tool handling,
+and RBAC denial paths. Run it with:
+
+```bash
+cd apps/api
+python -m app.evaluation
+```
+
+The report lists total, passed, failed, pass rate, category, case name, expected
+behavior, and actual behavior. It uses the local deterministic provider and does
+not require an OpenAI API key. This is behavior regression evaluation, not LLM
+quality scoring.
+
+Application logs include request correlation IDs and safe operation fields for
+agent intent classification, retrieval, tool calls, incident lifecycle events,
+and MCP failures. Operation durations are recorded where useful; secrets,
+credentials, cookies, tokens, and document contents are not logged. `/health`
+remains the liveness/database check, while `/ready` checks database and Redis
+availability.
+
 See [the architecture diagram](docs/architecture.md) for the service boundaries and local dependencies.

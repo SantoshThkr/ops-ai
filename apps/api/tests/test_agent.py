@@ -1,3 +1,6 @@
+import logging
+
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -30,7 +33,10 @@ def test_parse_intent_prioritizes_incident_requests_over_metrics() -> None:
     assert proposal.kind == IntentKind.INCIDENT
 
 
-def test_local_agent_metrics_are_deterministic_and_read_only() -> None:
+def test_local_agent_metrics_are_deterministic_and_read_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
     with _session() as db:
         user = User(
             email="agent@example.com",
@@ -57,6 +63,9 @@ def test_local_agent_metrics_are_deterministic_and_read_only() -> None:
     assert names == ["tool_call", "tool_result", "token", "done"]
     assert events[1][1]["read_only"] is True
     assert "api error_rate" in events[2][1]["text"]
+    messages = [record.message for record in caplog.records]
+    assert "agent.intent_classified" in messages
+    assert "agent.tool_execution.completed" in messages
 
 
 def test_casual_chat_does_not_invoke_a_tool() -> None:
@@ -127,4 +136,3 @@ def test_incident_proposal_requires_approval_and_is_one_time() -> None:
         assert approval.decision == ApprovalDecision.APPROVED
         executed = execute(db, action, admin)
         assert executed.status == ActionStatus.EXECUTED
-        assert execute(db, action, admin).id == executed.id

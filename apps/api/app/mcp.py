@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 from uuid import UUID
 
@@ -11,6 +13,8 @@ from app.incidents import audit, get_incident, propose
 from app.models import User, UserRole
 from app.schemas import IncidentProposalCreate
 from app.tools import get_metric, search_knowledge, tool_catalog
+
+logger = logging.getLogger(__name__)
 
 
 def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
@@ -26,6 +30,15 @@ def _failed(
     code: int = -32602,
     tool: str | None = None,
 ) -> dict[str, Any]:
+    logger.warning(
+        "mcp_request_failed",
+        extra={
+            "operation": "mcp_request",
+            "tool": tool,
+            "user_id": str(user.id),
+            "status": "failed",
+        },
+    )
     audit(
         db,
         user,
@@ -39,11 +52,21 @@ def _failed(
 
 
 def handle_request(request: dict[str, Any], db: Session, user: User) -> dict[str, Any]:
+    started = time.monotonic()
     request_id = request.get("id")
     if request.get("jsonrpc") != "2.0":
         return _failed(request_id, db, user, "Invalid JSON-RPC request", code=-32600)
     method = request.get("method")
     if method == "tools/list":
+        logger.info(
+            "mcp_request_completed",
+            extra={
+                "operation": "mcp_tools_list",
+                "user_id": str(user.id),
+                "status": "completed",
+                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+            },
+        )
         return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": tool_catalog()}}
     if method != "tools/call":
         return _failed(request_id, db, user, "Method not found", code=-32601)
@@ -125,10 +148,30 @@ def handle_request(request: dict[str, Any], db: Session, user: User) -> dict[str
         db.commit()
         return _error(request_id, -32602, "Invalid tool arguments")
     except Exception:
+        logger.exception(
+            "mcp_tool_failed",
+            extra={
+                "operation": "mcp_tool_call",
+                "tool": name,
+                "user_id": str(user.id),
+                "status": "failed",
+                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+            },
+        )
         db.rollback()
         audit(db, user, "mcp.tool_failed", "tool", name)
         db.commit()
         return _error(request_id, -32000, "Tool execution failed")
+    logger.info(
+        "mcp_tool_completed",
+        extra={
+            "operation": "mcp_tool_call",
+            "tool": name,
+            "user_id": str(user.id),
+            "status": "completed",
+            "duration_ms": round((time.monotonic() - started) * 1000, 2),
+        },
+    )
     return {
         "jsonrpc": "2.0",
         "id": request_id,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +13,8 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import ServiceMetric, User
 from app.schemas import MetricResponse, SearchResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -51,8 +55,34 @@ def search_knowledge(
 
     settings = get_settings()
     requested = top_k or settings.retrieval_top_k
-    rows = _search_owned_chunks(db, user, query, max(1, min(requested, 50)))
-    return [row for row in rows if row.similarity >= settings.retrieval_similarity_threshold]
+    started = time.monotonic()
+    try:
+        rows = _search_owned_chunks(db, user, query, max(1, min(requested, 50)))
+        results = [row for row in rows if row.similarity >= settings.retrieval_similarity_threshold]
+    except Exception:
+        logger.exception(
+            "tool_failed",
+            extra={
+                "operation": "tool_execution",
+                "tool": "search_knowledge",
+                "user_id": str(user.id),
+                "status": "failed",
+                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+            },
+        )
+        raise
+    logger.info(
+        "tool_completed",
+        extra={
+            "operation": "tool_execution",
+            "tool": "search_knowledge",
+            "user_id": str(user.id),
+            "status": "completed",
+            "result_count": len(results),
+            "duration_ms": round((time.monotonic() - started) * 1000, 2),
+        },
+    )
+    return results
 
 
 def get_metric(
@@ -60,7 +90,26 @@ def get_metric(
     service: str | None = None,
     name: str | None = None,
 ) -> list[MetricResponse]:
+    logger.info(
+        "tool_call",
+        extra={
+            "operation": "tool_execution",
+            "tool": "get_metric",
+            "status": "requested",
+            "service": service,
+            "metric": name,
+        },
+    )
     if name is not None and name not in ALLOWED_METRICS:
+        logger.warning(
+            "tool_failed",
+            extra={
+                "operation": "tool_execution",
+                "tool": "get_metric",
+                "status": "invalid_metric",
+                "metric": name,
+            },
+        )
         return []
     statement = select(ServiceMetric).order_by(ServiceMetric.service, ServiceMetric.name).limit(100)
     if service:

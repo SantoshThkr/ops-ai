@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -21,6 +23,8 @@ from app.models import (
     UserRole,
 )
 from app.schemas import IncidentProposalCreate
+
+logger = logging.getLogger(__name__)
 
 
 def _expired(expires_at: datetime) -> bool:
@@ -70,7 +74,16 @@ def get_incident(db: Session, user: User, incident_id: UUID) -> Incident | None:
 
 
 def propose(db: Session, owner: User, payload: IncidentProposalCreate) -> Incident:
+    started = time.monotonic()
     if not can_operate(owner):
+        logger.warning(
+            "incident_permission_denied",
+            extra={
+                "operation": "incident.propose",
+                "user_id": str(owner.id),
+                "status": "denied",
+            },
+        )
         audit(db, owner, "permission.denied", "incident", None, {"operation": "propose"})
         db.commit()
         raise PermissionError("Only analysts and administrators can create incident proposals")
@@ -153,6 +166,16 @@ def propose(db: Session, owner: User, payload: IncidentProposalCreate) -> Incide
                     return existing_incident
         raise
     db.refresh(incident)
+    logger.info(
+        "incident_proposed",
+        extra={
+            "operation": "incident.propose",
+            "user_id": str(owner.id),
+            "incident_id": str(incident.id),
+            "status": "completed",
+            "duration_ms": round((time.monotonic() - started) * 1000, 2),
+        },
+    )
     return incident
 
 
@@ -163,7 +186,17 @@ def approve(
     decision: ApprovalDecision,
     idempotency_key: str | None,
 ) -> Approval:
+    started = time.monotonic()
     if not can_approve(approver):
+        logger.warning(
+            "incident_permission_denied",
+            extra={
+                "operation": "incident.approve",
+                "user_id": str(approver.id),
+                "action_id": str(action.id),
+                "status": "denied",
+            },
+        )
         audit(db, approver, "permission.denied", "action", action.id, {"operation": "approve"})
         db.commit()
         raise PermissionError("You do not have permission to approve this action")
@@ -222,16 +255,37 @@ def approve(
             return existing
         raise
     db.refresh(approval)
+    logger.info(
+        "incident_approved",
+        extra={
+            "operation": "incident.approve",
+            "user_id": str(approver.id),
+            "action_id": str(action.id),
+            "status": approval.decision.value,
+            "duration_ms": round((time.monotonic() - started) * 1000, 2),
+        },
+    )
     return approval
 
 
 def execute(db: Session, action: Action, actor: User) -> Action:
+    started = time.monotonic()
     if not can_approve(actor):
         audit(db, actor, "permission.denied", "action", action.id, {"operation": "execute"})
         db.commit()
         raise PermissionError("You do not have permission to execute this action")
     action = db.scalar(select(Action).where(Action.id == action.id).with_for_update()) or action
     if action.status == ActionStatus.EXECUTED:
+        logger.info(
+            "incident_execution_idempotent",
+            extra={
+                "operation": "incident.execute",
+                "user_id": str(actor.id),
+                "action_id": str(action.id),
+                "status": "idempotent",
+                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+            },
+        )
         return action
     if _expired(action.expires_at):
         action.status = ActionStatus.EXPIRED
@@ -253,6 +307,17 @@ def execute(db: Session, action: Action, actor: User) -> Action:
     audit(db, actor, "action.executed", "action", action.id, action.result)
     db.commit()
     db.refresh(action)
+    logger.info(
+        "incident_executed",
+        extra={
+            "operation": "incident.execute",
+            "user_id": str(actor.id),
+            "action_id": str(action.id),
+            "incident_id": str(action.incident_id),
+            "status": "completed",
+            "duration_ms": round((time.monotonic() - started) * 1000, 2),
+        },
+    )
     return action
 
 

@@ -20,6 +20,8 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from redis import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import bindparam, func, literal_column, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -57,6 +59,7 @@ from app.models import (
     User,
     UserRole,
 )
+from app.observability import request_id_context
 from app.schemas import (
     ActionResponse,
     ApprovalCreate,
@@ -99,19 +102,23 @@ app.add_middleware(
 async def request_logging(request: Request, call_next: Any) -> Response:
     started = time.monotonic()
     request_id = request.headers.get("x-request-id", str(uuid4()))
-    response = cast(Response, await call_next(request))
-    response.headers["x-request-id"] = request_id
-    logger.info(
-        "request_complete",
-        extra={
-            "request_id": request_id,
-            "method": request.method,
-            "path": request.url.path,
-            "status_code": response.status_code,
-            "duration_ms": round((time.monotonic() - started) * 1000, 2),
-        },
-    )
-    return response
+    token = request_id_context.set(request_id)
+    try:
+        response = cast(Response, await call_next(request))
+        response.headers["x-request-id"] = request_id
+        logger.info(
+            "request_complete",
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+            },
+        )
+        return response
+    finally:
+        request_id_context.reset(token)
 
 
 def _set_auth_cookie(response: Response, token: str) -> None:
@@ -158,6 +165,20 @@ def health() -> dict[str, str]:
     except SQLAlchemyError as error:
         raise HTTPException(status_code=503, detail="Database unavailable") from error
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness() -> dict[str, str]:
+    try:
+        check_database_connection()
+        Redis.from_url(
+            settings.redis_url,
+            socket_connect_timeout=0.2,
+            socket_timeout=0.2,
+        ).ping()
+    except (SQLAlchemyError, RedisError, OSError, TimeoutError) as error:
+        raise HTTPException(status_code=503, detail="Dependencies unavailable") from error
+    return {"status": "ready"}
 
 
 @app.get("/version")
@@ -424,6 +445,7 @@ def get_document(
 
 
 def _search_owned_chunks(db: Session, user: User, query: str, top_k: int) -> list[SearchResult]:
+    started = time.monotonic()
     query_vector = embedding_provider(settings).embed([query])[0]
     base_query = (
         select(DocumentChunk, Document.filename)
@@ -446,7 +468,7 @@ def _search_owned_chunks(db: Session, user: User, query: str, top_k: int) -> lis
             .order_by(similarity.desc(), DocumentChunk.id.asc())
             .limit(top_k)
         ).all()
-        return [
+        results = [
             SearchResult(
                 document_id=chunk.document_id,
                 chunk_id=chunk.id,
@@ -458,6 +480,17 @@ def _search_owned_chunks(db: Session, user: User, query: str, top_k: int) -> lis
             for chunk, filename, score in vector_rows
             if float(score) >= settings.retrieval_similarity_threshold
         ]
+        logger.info(
+            "rag_retrieval_completed",
+            extra={
+                "operation": "rag_retrieval",
+                "user_id": str(user.id),
+                "status": "completed",
+                "result_count": len(results),
+                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+            },
+        )
+        return results
     rows = db.execute(base_query).all()
     scored = [
         (

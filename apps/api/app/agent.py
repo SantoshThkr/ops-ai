@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
@@ -11,8 +12,11 @@ from sqlalchemy.orm import Session
 
 from app.incidents import audit, propose
 from app.models import User, UserRole
+from app.observability import log_event, timed_operation
 from app.schemas import IncidentProposalCreate
 from app.tools import get_metric, search_knowledge
+
+logger = logging.getLogger(__name__)
 
 
 class IntentKind(StrEnum):
@@ -99,12 +103,26 @@ def stream(
     conversation_id: Any = None,
 ) -> Iterator[tuple[str, dict[str, Any]]]:
     intent = parse_intent(question)
+    log_event(
+        logger,
+        "agent.intent_classified",
+        operation="intent_classification",
+        user_id=str(user.id),
+        status="completed",
+        intent=intent.kind.value,
+    )
     if intent.kind == IntentKind.METRIC:
         arguments: dict[str, Any] = {}
         if intent.metric_name:
             arguments["name"] = intent.metric_name
         yield "tool_call", {"name": "get_metric", "arguments": arguments}
-        metrics = get_metric(db, name=intent.metric_name)
+        with timed_operation(
+            logger,
+            "agent.tool_execution",
+            tool="get_metric",
+            user_id=str(user.id),
+        ):
+            metrics = get_metric(db, name=intent.metric_name)
         metric_result = [item.model_dump(mode="json") for item in metrics]
         yield (
             "tool_result",
@@ -125,8 +143,24 @@ def stream(
         return
 
     if intent.kind == IntentKind.INCIDENT:
+        log_event(
+            logger,
+            "agent.tool_call",
+            operation="tool_call",
+            tool="create_incident",
+            user_id=str(user.id),
+            status="requested",
+        )
         yield "tool_call", {"name": "create_incident", "arguments": {"summary": question}}
         if user.role not in {UserRole.ADMIN, UserRole.ANALYST}:
+            log_event(
+                logger,
+                "agent.permission_denied",
+                operation="incident.propose",
+                tool="create_incident",
+                user_id=str(user.id),
+                status="denied",
+            )
             audit(db, user, "permission.denied", "incident", None, {"operation": "propose"})
             db.commit()
             yield (
@@ -140,18 +174,23 @@ def stream(
             yield "error", {"message": "You do not have permission to create incident proposals."}
             yield "done", {"status": "denied"}
             return
-        incident = propose(
-            db,
-            user,
-            IncidentProposalCreate(
-                title="Agent incident proposal",
-                summary=question,
-                severity="high" if "outage" in question.casefold() else "medium",
-                action_kind=intent.action_kind or "restart_service",
-                action_parameters={"service": "api"},
-                conversation_id=conversation_id,
-            ),
-        )
+        with timed_operation(
+            logger,
+            "agent.incident_operation",
+            user_id=str(user.id),
+        ):
+            incident = propose(
+                db,
+                user,
+                IncidentProposalCreate(
+                    title="Agent incident proposal",
+                    summary=question,
+                    severity="high" if "outage" in question.casefold() else "medium",
+                    action_kind=intent.action_kind or "restart_service",
+                    action_parameters={"service": "api"},
+                    conversation_id=conversation_id,
+                ),
+            )
         action = incident.actions[0] if incident.actions else None
         result = {
             "incident_id": str(incident.id),
@@ -184,7 +223,13 @@ def stream(
 
     # Knowledge requests remain on the existing grounded chat path.
     yield "tool_call", {"name": "search_knowledge", "arguments": {"query": question}}
-    results = search_knowledge(db, user, question)
+    with timed_operation(
+        logger,
+        "agent.tool_execution",
+        tool="search_knowledge",
+        user_id=str(user.id),
+    ):
+        results = search_knowledge(db, user, question)
     yield (
         "tool_result",
         {
