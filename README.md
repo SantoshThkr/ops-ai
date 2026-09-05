@@ -115,6 +115,12 @@ npm run typecheck
 npm run test
 ```
 
+GitHub Actions runs the same backend and frontend checks on every push and pull
+request. CI installs the local deterministic providers only; it does not require
+PostgreSQL, Redis, an OpenAI API key, or any other external AI service. The
+backend job runs Ruff, format validation, mypy, and pytest. The frontend job
+runs Vitest, ESLint, TypeScript validation, and the production build.
+
 ## Evaluation and observability
 
 OpsAI includes a small offline deterministic evaluation suite for knowledge-context

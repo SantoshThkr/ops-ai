@@ -554,4 +554,96 @@ describe('HomePage', () => {
     });
     expect(screen.queryByText('Sources')).not.toBeInTheDocument();
   });
+
+  it('renders approval-required state and approval failures', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          user: {
+            id: 'user-id',
+            email: 'admin@example.com',
+            name: 'Admin',
+            role: 'admin',
+            active: true,
+          },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ items: [], page: 1, page_size: 20, total: 0 }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          items: [
+            {
+              id: 'conversation-id',
+              title: 'Incident request',
+              created_at: '2026-08-28T00:00:00Z',
+              updated_at: '2026-08-28T00:00:00Z',
+              user_id: 'user-id',
+            },
+          ],
+          page: 1,
+          page_size: 20,
+          total: 1,
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          id: 'conversation-id',
+          title: 'Incident request',
+          created_at: '2026-08-28T00:00:00Z',
+          updated_at: '2026-08-28T00:00:00Z',
+          user_id: 'user-id',
+          messages: [],
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                'event: approval_required\ndata: {"action_id":"action-id","incident_id":"incident-id","expires_at":"2026-08-28T01:00:00Z"}\n\n' +
+                  'event: done\ndata: {"status":"completed"}\n\n',
+              ),
+            );
+            controller.close();
+          },
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => ({ detail: 'Approval is not permitted.' }),
+      } as Response);
+
+    render(<HomePage />);
+    await waitFor(() => {
+      expect(screen.getAllByText('Incident request').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.change(screen.getByLabelText('Chat message'), {
+      target: { value: 'Restart the api service.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    expect(
+      await screen.findByText('Approval required before this action can run.'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Something went wrong. Please try again.',
+    );
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument();
+  });
 });
