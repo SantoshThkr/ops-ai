@@ -1,147 +1,195 @@
 # OpsAI
 
-OpsAI is an enterprise AI operations platform. This repository contains the production-style foundation for the web application, API, shared contracts, and local infrastructure.
+OpsAI is a production-style AI operations platform demonstrating grounded
+knowledge retrieval, read-only service metrics, and approval-gated incident
+workflows. It is designed to run locally with deterministic providers and does
+not require an OpenAI API key.
+
+## Problem
+
+Operations teams need answers grounded in internal documents and recorded
+service data, while operational mutations must remain controlled, auditable,
+and permission-aware.
+
+## Solution
+
+OpsAI combines an authenticated Next.js frontend with a FastAPI backend, an
+owner-scoped RAG pipeline, typed allowlisted tools, RBAC, approval gates,
+idempotent action execution, audit logs, Redis rate limiting, and an
+authenticated MCP-style JSON-RPC adapter.
 
 ## Architecture
 
-- `apps/web`: Next.js, React, TypeScript, Tailwind CSS frontend
-- `apps/api`: FastAPI backend with SQLAlchemy and Alembic
-- `packages/shared`: shared TypeScript constants and contracts
-- `infra/docker`: Dockerfiles and Docker Compose for local services
-- `docs`: architecture and project documentation
-
-PostgreSQL is the primary database and enables the `pgvector` extension during the initial migration. Redis carries a small document-processing queue, and the worker extracts, chunks, and embeds uploaded files.
-
-## Local setup
-
-1. Copy the environment template:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Start the complete local stack:
-
-   ```bash
-   docker compose -f infra/docker/docker-compose.yml up --build
-   ```
-
-3. Open:
-
-   - Web: http://localhost:3000
-   - API docs: http://localhost:8000/docs
-   - API health: http://localhost:8000/health
-
-The API exposes `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, and
-`GET /me`. Registration creates viewer accounts; authenticated role probes are
-available at `/rbac/viewer`, `/rbac/analyst`, and `/rbac/admin`. Login and
-registration set an HTTP-only authentication cookie.
-Set `JWT_SECRET` to a long random value outside local development.
-
-Document ingestion uses `POST /documents` (PDF, TXT, and Markdown), `GET /documents`
-and `GET /documents/{id}`. `POST /documents/search` performs owner-scoped retrieval
-over completed chunks. The API writes files below `STORAGE_DIR` using generated UUID
-keys; it never uses client filenames as paths. The local embedding provider is
-deterministic and requires no paid API. Set `EMBEDDING_PROVIDER=external`,
-`EMBEDDING_API_URL`, and `EMBEDDING_API_KEY` to use a compatible embedding API.
-
-The chat layer adds authenticated conversations and grounded RAG responses. Use
-`POST /conversations` to create a chat, `GET /conversations` to list owned history,
-and `POST /conversations/{conversation_id}/messages` for streaming responses with
-SSE token/citation/done events. The server only retrieves chunks belonging to the
-current user, keeps a bounded history window, and returns empty-context messaging
-rather than hallucinating answers. Set `CHAT_PROVIDER=openai` and an API key to use
-OpenAI Responses API; otherwise the local deterministic provider is used for tests
-and offline development.
-
-The local agent uses a typed deterministic intent parser and exposes the
-allowlisted `search_knowledge`, `get_metric`, `get_incident`, and
-`create_incident` tools. Metrics are read-only recorded values (including
-payment failure rate, daily error rate, and transaction count); no metric is
-invented when the database has no observation. Incident creation is proposal
-only: analysts and administrators must approve an unexpired action before the
-single persisted execution boundary can run it. Tool activity is streamed as
-`tool_call`/`tool_result` SSE events; proposals emit `approval_required` and
-never perform an external side effect.
-Analysts and admins can approve and execute actions through `/actions/{id}/approve` and
-`/actions/{id}/execute`; all changes are persisted and visible in `/audit-logs`.
-`GET /metrics` and `POST /metrics/query` are read-only. A dependency-free,
-authenticated JSON-RPC adapter is available at `POST /mcp` for `tools/list` and
-`tools/call` over the same services and authorization rules. Redis rate limiting safely degrades when Redis is
-unavailable.
-
-Compose starts the separate `worker` service. Run it manually with `python -m app.worker`
-after migrations.
-
-Run migrations locally with:
-
-```bash
-cd apps/api
-alembic upgrade head
+```text
+Browser
+  -> Next.js frontend
+  -> FastAPI API
+  -> controlled deterministic agent
+  -> typed allowlisted tools
+  -> RAG / metrics / incidents
+  -> approval gate
+  -> audit log
+  -> PostgreSQL + pgvector
+  -> Redis
 ```
 
-The document schema is migration `0003_documents_rag`. After starting Compose,
-the API and worker apply migrations automatically.
+- `apps/web`: Next.js, React, TypeScript, Tailwind CSS, and SSE chat UI
+- `apps/api`: FastAPI, SQLAlchemy, Alembic, authentication, agent, tools, and workflows
+- `packages/shared`: intentionally small shared TypeScript contracts
+- `infra/docker`: PostgreSQL/pgvector, Redis, API, worker, and web containers
+- `docs`: architecture documentation
 
-## Environment variables
+PostgreSQL is the durable system of record and stores documents, chunks,
+conversations, metrics, incidents, approvals, and audit events. Redis carries
+document-processing jobs and supports rate limiting. Uploaded files use generated
+storage keys outside the source tree.
 
-See `.env.example` for the complete local configuration. `NEXT_PUBLIC_API_URL` is exposed to the browser; database, Redis, and JWT settings are backend-only.
+## Security and control boundaries
 
-## Development commands
+The API owns validation, authorization, business logic, and persistence. The
+frontend never decides permissions. Viewer users cannot propose incidents;
+analysts and administrators can propose; administrators alone approve and
+execute. Mutating actions require an unexpired approval and are protected by
+database-backed idempotency.
 
-```bash
-# Frontend
-npm install
-npm run dev:web
-npm run lint:web
-npm run typecheck:web
-npm run test:web
+The four tools are:
 
-# Backend
-cd apps/api
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-pytest
-ruff check .
-mypy app
-```
+| Tool | Purpose | Mutation |
+| --- | --- | --- |
+| `search_knowledge` | Owner-scoped document retrieval | No |
+| `get_metric` | Read an allowlisted recorded metric | No |
+| `get_incident` | Read an authorized incident | No |
+| `create_incident` | Create an approval-required proposal | Proposal only |
 
-## Checks
+Tool names and arguments are validated against an allowlist. Every important
+workflow writes audit events. Authentication uses HTTP-only cookies, request
+IDs are correlated in logs, and Redis rate limiting fails safely according to
+its documented local-development behavior.
 
-```bash
-npm run lint
-npm run typecheck
-npm run test
-```
+The API exposes an authenticated **MCP-style JSON-RPC adapter** at `POST /mcp`.
+It reuses the same service and tool implementations; it is not described as a
+standards-certified MCP server.
 
-GitHub Actions runs the same backend and frontend checks on every push and pull
-request. CI installs the local deterministic providers only; it does not require
-PostgreSQL, Redis, an OpenAI API key, or any other external AI service. The
-backend job runs Ruff, format validation, mypy, and pytest. The frontend job
-runs Vitest, ESLint, TypeScript validation, and the production build.
+## Agent and approval workflow
+
+The local agent uses typed deterministic intent routing. Knowledge requests use
+owner-scoped retrieval and similarity thresholding. Metric requests only read
+persisted allowlisted values. Incident requests create proposals and stream
+`approval_required` activity; no external side effect occurs before approval.
+
+## Demo flow
+
+1. Register and upload a PDF, TXT, or Markdown document.
+2. Ask a grounded question about the uploaded document and inspect citations.
+3. Ask a metric question such as “What is the latency?”
+4. Confirm a viewer is denied when requesting an incident mutation.
+5. Use an analyst account to create an incident proposal.
+6. Use an administrator account to approve the action.
+7. Execute the approved action as an administrator.
+8. Inspect the resulting audit record through the API.
 
 ## Evaluation and observability
 
-OpsAI includes a small offline deterministic evaluation suite for knowledge-context
-gating, allowlisted metrics, incident approval and idempotency, MCP tool handling,
-and RBAC denial paths. Run it with:
+The offline evaluator exercises deterministic behavior for knowledge context
+gating, metrics, incident lifecycle and idempotency, RBAC, and MCP requests:
 
 ```bash
 cd apps/api
 python -m app.evaluation
 ```
 
-The report lists total, passed, failed, pass rate, category, case name, expected
-behavior, and actual behavior. It uses the local deterministic provider and does
-not require an OpenAI API key. This is behavior regression evaluation, not LLM
-quality scoring.
+It reports total cases, passed, failed, pass rate, category, case name,
+expected behavior, and actual behavior. This is regression evaluation, not LLM
+quality scoring. Structured logs include request IDs, operation/tool, user,
+status, resource identifiers, and useful durations without logging credentials,
+tokens, cookies, API keys, or document contents.
 
-Application logs include request correlation IDs and safe operation fields for
-agent intent classification, retrieval, tool calls, incident lifecycle events,
-and MCP failures. Operation durations are recorded where useful; secrets,
-credentials, cookies, tokens, and document contents are not logged. `/health`
-remains the liveness/database check, while `/ready` checks database and Redis
-availability.
+`/health` is a cheap liveness/database check. `/ready` checks database and Redis
+availability and is suitable for dependency-aware routing decisions.
 
-See [the architecture diagram](docs/architecture.md) for the service boundaries and local dependencies.
+## Local development
+
+1. Copy the safe template and replace placeholders:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Set a long random `JWT_SECRET`. Keep `AUTH_COOKIE_SECURE=false` only for
+   local HTTP development; use `true` behind HTTPS.
+
+3. Start the stack:
+
+   ```bash
+   docker compose --env-file .env -f infra/docker/docker-compose.yml up --build
+   ```
+
+4. Open:
+
+   - Web: http://localhost:3000
+   - API docs: http://localhost:8000/docs
+   - Liveness: http://localhost:8000/health
+   - Readiness: http://localhost:8000/ready
+
+Run migrations manually when developing the API outside Compose:
+
+```bash
+cd apps/api
+alembic upgrade head
+```
+
+## Testing and CI/CD
+
+Backend:
+
+```bash
+cd apps/api
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+pytest
+ruff check app tests
+ruff format --check app tests
+mypy app
+```
+
+Frontend:
+
+```bash
+npm ci
+npm run test:web
+npm run lint:web
+npm run typecheck:web
+npm run build:web
+```
+
+GitHub Actions in `.github/workflows/ci.yml` runs these backend and frontend
+checks on every push and pull request. CI uses local deterministic behavior and
+requires no paid AI service, API key, or external runtime dependency.
+
+## Key engineering decisions
+
+- deterministic local providers keep development and CI reproducible
+- retrieval is owner-scoped and thresholded before citations are emitted
+- typed allowlists prevent arbitrary tool or SQL routing
+- approval-before-mutation separates proposal from execution
+- database locking and idempotency protect repeated actions
+- audit logs and request-correlated structured logs support investigation
+- the MCP-style adapter reuses existing authorization and service boundaries
+- the evaluation suite tests behavior rather than inventing model-quality scores
+
+## Limitations
+
+The local provider is deterministic and intentionally limited; it is not a
+general-purpose production LLM. Incident execution is a persisted local
+execution boundary and does not integrate with external ticketing or cloud
+operations systems. The repository includes practical local Docker and CI
+preparation, but deployment, secret management, TLS termination, backups,
+scaling, and production monitoring remain infrastructure responsibilities.
+
+## Configuration
+
+`.env.example` contains placeholders only. `.env` is ignored by Git. Database,
+Redis, JWT, cookie, storage, retrieval, provider, and frontend API settings are
+configurable through environment variables. The local provider defaults remain
+safe for offline development.

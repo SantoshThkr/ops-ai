@@ -2,67 +2,58 @@
 
 ```mermaid
 flowchart LR
-    Browser[Browser] --> Web[Next.js web]
+    Browser[Browser] --> Web[Next.js frontend]
     Web --> API[FastAPI API]
-    API --> Postgres[(PostgreSQL + pgvector)]
+    API --> Agent[Controlled deterministic agent]
+    Agent --> Tools[Typed allowlisted tools]
+    Tools --> RAG[RAG retrieval]
+    Tools --> Metrics[Recorded metrics]
+    Tools --> Incidents[Incident proposals]
+    Incidents --> Approval[Admin approval gate]
+    Approval --> Audit[Audit log]
+    RAG --> Postgres[(PostgreSQL + pgvector)]
+    Metrics --> Postgres
+    Incidents --> Postgres
+    Audit --> Postgres
     API --> Redis[(Redis)]
-    API --> Storage[(Local document storage)]
     Redis --> Worker[Document worker]
     Worker --> Postgres
-    Worker --> Storage
-
-    Browser --> Chat[Chat UI]
-    Chat --> API
-    API --> Retrieval[RAG retrieval]
-    Retrieval --> Postgres
-    API --> LLM[OpenAI Responses API]
-    LLM --> Chat
-    API --> Agent[Local deterministic agent]
-    Agent --> Tools[Typed safe tools]
-    API --> Audit[Audit log]
+    Worker --> Storage[(Generated-key document storage)]
+    API -. optional provider .-> Local[Local deterministic provider]
 ```
 
-The local agent uses the same thresholded, owner-scoped retrieval implementation
-and exposes allowlisted knowledge/metric/incident tools. Incident creation is
-proposal-only; actions are persisted with ownership, expiry, approval, audit
-events, and a database-protected one-time execution boundary.
+## Boundaries
 
-The web app owns presentation and browser configuration. The API owns validation,
-business logic, and persistence access. PostgreSQL is the durable system of record;
-Redis carries document jobs to the worker, and local storage holds generated-key
-uploads outside the source tree. Shared TypeScript contracts remain intentionally
-small until a cross-application use case exists.
+The browser owns presentation and SSE rendering. FastAPI owns authentication,
+validation, authorization, orchestration, persistence, and safe error handling.
+The agent can select only typed allowlisted tools:
 
-## Chat architecture
+- `search_knowledge`
+- `get_metric`
+- `get_incident`
+- `create_incident`
 
-```text
-Browser
-   ↓
-Next.js
-   ↓
-FastAPI
-   ↓
-Conversation Service
-   ↓
-RAG Retrieval
-   ↓
-LLM Provider
-   ↓
-SSE Stream
-   ↓
-Browser
-```
+Knowledge retrieval is owner-scoped and similarity-thresholded. Metrics are
+read-only persisted observations. Incident creation creates a proposal; an
+administrator must approve an unexpired action before execution. Execution is
+persisted atomically and idempotently, and every important state transition is
+audited.
 
-```text
-User
- ↓
-Conversation
- ↓
-Message
- ↓
-Retrieval
- ↓
-Documents
- ↓
-Chunks
-```
+`POST /mcp` is an authenticated MCP-style JSON-RPC adapter exposing the same
+service and tool implementations. It is intentionally documented as an adapter,
+not as a standards-certified MCP server.
+
+## Runtime dependencies
+
+- PostgreSQL with pgvector stores durable application state and embeddings.
+- Redis carries document jobs and supports rate limiting.
+- The API exposes `/health` for cheap liveness/database status.
+- The API exposes `/ready` for database and Redis dependency readiness.
+- The worker consumes Redis jobs and writes processed document chunks.
+
+## Development and delivery
+
+The local deterministic provider is the default, so tests, evaluation, and CI
+do not require `OPENAI_API_KEY` or another paid AI service. GitHub Actions runs
+Ruff, formatting, mypy, pytest, Vitest, ESLint, TypeScript validation, and the
+Next.js production build on pushes and pull requests.
