@@ -4,13 +4,13 @@ from contextlib import contextmanager
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db import get_db
 from app.main import app
-from app.models import Base
+from app.models import AuditLog, Base, User
 from app.schemas import SearchResult
 
 
@@ -114,7 +114,7 @@ def test_chat_deduplicates_citations_by_document_and_page(monkeypatch) -> None:
         document_two = uuid4()
 
         monkeypatch.setattr(
-            "app.main._search_owned_chunks",
+            "app.tools.search_owned_chunks",
             lambda *args, **kwargs: [
                 SearchResult(
                     document_id=document_one,
@@ -193,7 +193,7 @@ def test_chat_uses_no_context_when_similarity_is_below_threshold(monkeypatch) ->
         conversation_id = conversation.json()["id"]
 
         monkeypatch.setattr(
-            "app.main._search_owned_chunks",
+            "app.tools.search_owned_chunks",
             lambda *args, **kwargs: [
                 SearchResult(
                     document_id=uuid4(),
@@ -229,7 +229,7 @@ def test_chat_accepts_sufficient_similarity_as_grounded(monkeypatch) -> None:
         conversation_id = conversation.json()["id"]
 
         monkeypatch.setattr(
-            "app.main._search_owned_chunks",
+            "app.tools.search_owned_chunks",
             lambda *args, **kwargs: [
                 SearchResult(
                     document_id=uuid4(),
@@ -252,3 +252,110 @@ def test_chat_accepts_sufficient_similarity_as_grounded(monkeypatch) -> None:
         assert "I couldn't find enough information" not in body
         assert "event: citation" in body
         assert '"citations": []' not in body
+
+
+VPN_GUIDE = (
+    "Remote access guide. The VPN is configured with the corporate identity provider. "
+    "Employees must enable MFA before connecting. Support tickets go to the help desk."
+)
+
+
+def _owner(session_factory: sessionmaker[Session], email: str) -> User:
+    with session_factory() as db:
+        user = db.scalar(select(User).where(User.email == email))
+        assert user is not None
+        db.expunge(user)
+        return user
+
+
+def test_general_questions_search_documents_and_quote_the_source(
+    client_for, session_factory, add_document
+) -> None:
+    client = client_for("reader@example.com")
+    with session_factory() as db:
+        add_document(
+            db, _owner(session_factory, "reader@example.com"), VPN_GUIDE, filename="vpn.md"
+        )
+    conversation_id = client.post("/conversations", json={}).json()["id"]
+
+    # No "document"/"policy" marker words: this used to get a canned greeting.
+    # The local hash embedding needs matching word forms ("configured", not "configure").
+    response = client.post(
+        f"/conversations/{conversation_id}/messages",
+        json={"content": "How is the VPN configured?"},
+    )
+
+    events = _parse_sse_events(response.text)
+    names = [event["event"] for event in events]
+    assert names[:2] == ["tool_call", "tool_result"]
+    assert names[-2:] == ["citation", "done"]
+    answer = "".join(e["data"]["text"] for e in events if e["event"] == "token")
+    assert "The VPN is configured with the corporate identity provider." in answer
+    assert "vpn.md" in answer
+    stored = client.get(f"/conversations/{conversation_id}").json()["messages"]
+    # SQLite timestamps have one-second resolution, so compare by role, not position.
+    replies = [message for message in stored if message["role"] == "assistant"]
+    assert len(stored) == 2 and len(replies) == 1
+    assert "corporate identity provider" in replies[0]["content"]
+
+
+def test_unrelated_question_gets_capabilities_and_no_citations(
+    client_for, session_factory, add_document
+) -> None:
+    client = client_for("reader@example.com")
+    with session_factory() as db:
+        add_document(db, _owner(session_factory, "reader@example.com"), VPN_GUIDE)
+    conversation_id = client.post("/conversations", json={}).json()["id"]
+
+    response = client.post(
+        f"/conversations/{conversation_id}/messages",
+        json={"content": "What is the weather today?"},
+    )
+
+    events = _parse_sse_events(response.text)
+    answer = "".join(e["data"]["text"] for e in events if e["event"] == "token")
+    assert "event: citation" not in response.text
+    assert "report recorded service metrics" in answer
+
+
+def test_metric_questions_do_not_run_document_retrieval(client_for, monkeypatch) -> None:
+    client = client_for("metrics@example.com")
+    conversation_id = client.post("/conversations", json={}).json()["id"]
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise AssertionError("retrieval should not run for metric questions")
+
+    monkeypatch.setattr("app.tools.search_owned_chunks", fail)
+    response = client.post(
+        f"/conversations/{conversation_id}/messages", json={"content": "What is the latency?"}
+    )
+
+    events = _parse_sse_events(response.text)
+    assert events[0] == {
+        "event": "tool_call",
+        "data": {"name": "get_metric", "arguments": {"name": "latency_p95"}},
+    }
+    assert events[-1]["data"]["status"] == "completed"
+
+
+def test_stream_failures_are_reported_in_band_and_audited(
+    client_for, session_factory, monkeypatch
+) -> None:
+    client = client_for("failure@example.com")
+    conversation_id = client.post("/conversations", json={}).json()["id"]
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("vector store unavailable")
+
+    monkeypatch.setattr("app.chat.search_knowledge", broken)
+    response = client.post(
+        f"/conversations/{conversation_id}/messages", json={"content": "Summarize the policy"}
+    )
+
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    assert [event["event"] for event in events][-2:] == ["error", "done"]
+    assert events[-1]["data"] == {"status": "failed"}
+    assert "vector store" not in response.text
+    with session_factory() as db:
+        assert db.scalar(select(AuditLog).where(AuditLog.event == "chat.failed")) is not None

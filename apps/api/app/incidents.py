@@ -22,6 +22,7 @@ from app.models import (
     User,
     UserRole,
 )
+from app.observability import elapsed_ms, log_event
 from app.schemas import IncidentProposalCreate
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,17 @@ def _expired(expires_at: datetime) -> bool:
     if expires_at.tzinfo is None:
         current = current.replace(tzinfo=None)
     return expires_at <= current
+
+
+def _lock_action(db: Session, action: Action) -> Action:
+    """Lock the row and reload it; a cached instance would otherwise keep stale state."""
+    locked = db.scalar(
+        select(Action)
+        .where(Action.id == action.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return locked or action
 
 
 def audit(
@@ -76,13 +88,13 @@ def get_incident(db: Session, user: User, incident_id: UUID) -> Incident | None:
 def propose(db: Session, owner: User, payload: IncidentProposalCreate) -> Incident:
     started = time.monotonic()
     if not can_operate(owner):
-        logger.warning(
-            "incident_permission_denied",
-            extra={
-                "operation": "incident.propose",
-                "user_id": str(owner.id),
-                "status": "denied",
-            },
+        log_event(
+            logger,
+            "incident.permission_denied",
+            level=logging.WARNING,
+            operation="incident.propose",
+            user_id=str(owner.id),
+            status="denied",
         )
         audit(db, owner, "permission.denied", "incident", None, {"operation": "propose"})
         db.commit()
@@ -106,7 +118,7 @@ def propose(db: Session, owner: User, payload: IncidentProposalCreate) -> Incide
                 {"operation": "incident.propose"},
             )
             db.commit()
-            raise PermissionError("Conversation not found")
+            raise LookupError("Conversation not found")
     if payload.idempotency_key:
         existing_action = db.scalar(
             select(Action).where(
@@ -166,15 +178,15 @@ def propose(db: Session, owner: User, payload: IncidentProposalCreate) -> Incide
                     return existing_incident
         raise
     db.refresh(incident)
-    logger.info(
-        "incident_proposed",
-        extra={
-            "operation": "incident.propose",
-            "user_id": str(owner.id),
-            "incident_id": str(incident.id),
-            "status": "completed",
-            "duration_ms": round((time.monotonic() - started) * 1000, 2),
-        },
+    log_event(
+        logger,
+        "incident.proposed",
+        operation="incident.propose",
+        user_id=str(owner.id),
+        incident_id=str(incident.id),
+        action_count=len(action_specs),
+        status="completed",
+        duration_ms=elapsed_ms(started),
     )
     return incident
 
@@ -188,19 +200,19 @@ def approve(
 ) -> Approval:
     started = time.monotonic()
     if not can_approve(approver):
-        logger.warning(
-            "incident_permission_denied",
-            extra={
-                "operation": "incident.approve",
-                "user_id": str(approver.id),
-                "action_id": str(action.id),
-                "status": "denied",
-            },
+        log_event(
+            logger,
+            "incident.permission_denied",
+            level=logging.WARNING,
+            operation="incident.approve",
+            user_id=str(approver.id),
+            action_id=str(action.id),
+            status="denied",
         )
         audit(db, approver, "permission.denied", "action", action.id, {"operation": "approve"})
         db.commit()
         raise PermissionError("You do not have permission to approve this action")
-    action = db.scalar(select(Action).where(Action.id == action.id).with_for_update()) or action
+    action = _lock_action(db, action)
     existing = db.scalar(
         select(Approval).where(
             Approval.action_id == action.id,
@@ -255,15 +267,14 @@ def approve(
             return existing
         raise
     db.refresh(approval)
-    logger.info(
-        "incident_approved",
-        extra={
-            "operation": "incident.approve",
-            "user_id": str(approver.id),
-            "action_id": str(action.id),
-            "status": approval.decision.value,
-            "duration_ms": round((time.monotonic() - started) * 1000, 2),
-        },
+    log_event(
+        logger,
+        "incident.approval_recorded",
+        operation="incident.approve",
+        user_id=str(approver.id),
+        action_id=str(action.id),
+        status=approval.decision.value,
+        duration_ms=elapsed_ms(started),
     )
     return approval
 
@@ -274,29 +285,35 @@ def execute(db: Session, action: Action, actor: User) -> Action:
         audit(db, actor, "permission.denied", "action", action.id, {"operation": "execute"})
         db.commit()
         raise PermissionError("You do not have permission to execute this action")
-    action = db.scalar(select(Action).where(Action.id == action.id).with_for_update()) or action
+    action = _lock_action(db, action)
     if action.status == ActionStatus.EXECUTED:
-        logger.info(
-            "incident_execution_idempotent",
-            extra={
-                "operation": "incident.execute",
-                "user_id": str(actor.id),
-                "action_id": str(action.id),
-                "status": "idempotent",
-                "duration_ms": round((time.monotonic() - started) * 1000, 2),
-            },
+        log_event(
+            logger,
+            "incident.execution_idempotent",
+            operation="incident.execute",
+            user_id=str(actor.id),
+            action_id=str(action.id),
+            status="idempotent",
+            duration_ms=elapsed_ms(started),
         )
         return action
-    if _expired(action.expires_at):
+    if action.status == ActionStatus.APPROVED and _expired(action.expires_at):
         action.status = ActionStatus.EXPIRED
         action.incident.status = IncidentStatus.CANCELLED
         audit(db, actor, "action.expired", "action", action.id)
         db.commit()
-        return action
+        raise ValueError("Action approval window has expired")
     if action.status != ActionStatus.APPROVED:
-        audit(db, actor, "action.execution_failed", "action", action.id)
+        audit(
+            db,
+            actor,
+            "action.execution_failed",
+            "action",
+            action.id,
+            {"status": action.status.value},
+        )
         db.commit()
-        raise ValueError("Action requires an approval before execution")
+        raise ValueError(f"Action cannot be executed while {action.status.value}")
     # This is the single local execution boundary. It is persisted atomically and
     # intentionally has no unapproved external side effect.
     action.status = ActionStatus.EXECUTED
@@ -307,16 +324,15 @@ def execute(db: Session, action: Action, actor: User) -> Action:
     audit(db, actor, "action.executed", "action", action.id, action.result)
     db.commit()
     db.refresh(action)
-    logger.info(
-        "incident_executed",
-        extra={
-            "operation": "incident.execute",
-            "user_id": str(actor.id),
-            "action_id": str(action.id),
-            "incident_id": str(action.incident_id),
-            "status": "completed",
-            "duration_ms": round((time.monotonic() - started) * 1000, 2),
-        },
+    log_event(
+        logger,
+        "incident.executed",
+        operation="incident.execute",
+        user_id=str(actor.id),
+        action_id=str(action.id),
+        incident_id=str(action.incident_id),
+        status="completed",
+        duration_ms=elapsed_ms(started),
     )
     return action
 

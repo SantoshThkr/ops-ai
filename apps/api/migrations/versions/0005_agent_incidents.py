@@ -145,3 +145,7 @@ def downgrade() -> None:
     op.drop_table("approvals")
     op.drop_table("actions")
     op.drop_table("incidents")
+    # op.drop_table does not remove native enum types; without this a re-upgrade fails.
+    bind = op.get_bind()
+    for name in ("approval_decision", "action_status", "incident_status"):
+        sa.Enum(name=name).drop(bind, checkfirst=True)

@@ -1,7 +1,8 @@
 import json
 import logging
-import math
 import time
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
@@ -22,13 +23,11 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from redis import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import bindparam, func, literal_column, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from starlette.responses import StreamingResponse
 
-from app.agent import IntentKind, parse_intent, should_handle
-from app.agent import stream as stream_agent
 from app.auth import (
     CurrentUser,
     create_access_token,
@@ -37,13 +36,13 @@ from app.auth import (
     require_roles,
     verify_password,
 )
-from app.chat import canonicalize_sources, get_chat_provider
-from app.config import get_settings
+from app.chat import stream_reply
+from app.config import get_settings, insecure_settings
 from app.db import check_database_connection, get_db
 from app.incidents import approve as approve_action
 from app.incidents import audit, can_manage, propose
 from app.incidents import execute as execute_action
-from app.ingestion import embedding_provider, enqueue, storage, validate_upload
+from app.ingestion import enqueue, storage, validate_upload
 from app.limits import check_rate_limit
 from app.mcp import handle_request as handle_mcp_request
 from app.models import (
@@ -52,21 +51,26 @@ from app.models import (
     AuditLog,
     Conversation,
     Document,
-    DocumentChunk,
     DocumentStatus,
     Incident,
     Message,
     User,
     UserRole,
 )
-from app.observability import request_id_context
+from app.observability import (
+    configure_logging,
+    elapsed_ms,
+    log_event,
+    request_id_context,
+    safe_request_id,
+)
+from app.retrieval import search_owned_chunks
 from app.schemas import (
     ActionResponse,
     ApprovalCreate,
     ApprovalResponse,
     AuditLogResponse,
     AuthResponse,
-    CitationResponse,
     ConversationCreate,
     ConversationDetailResponse,
     ConversationListResponse,
@@ -88,10 +92,29 @@ from app.schemas import (
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
-app = FastAPI(title="OpsAI API", version=settings.api_version)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    configure_logging(settings.log_level)
+    problems = insecure_settings(settings)
+    if problems and settings.app_env == "production":
+        raise RuntimeError("Refusing to start in production: " + "; ".join(problems))
+    for problem in problems:
+        log_event(
+            logger,
+            "config.insecure_for_production",
+            level=logging.WARNING,
+            app_env=settings.app_env,
+            problem=problem,
+        )
+    yield
+
+
+app = FastAPI(title="OpsAI API", version=settings.api_version, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -101,20 +124,32 @@ app.add_middleware(
 @app.middleware("http")
 async def request_logging(request: Request, call_next: Any) -> Response:
     started = time.monotonic()
-    request_id = request.headers.get("x-request-id", str(uuid4()))
+    request_id = safe_request_id(request.headers.get("x-request-id")) or str(uuid4())
     token = request_id_context.set(request_id)
+    method, path = request.method, request.url.path
     try:
         response = cast(Response, await call_next(request))
-        response.headers["x-request-id"] = request_id
-        logger.info(
-            "request_complete",
+    except Exception:
+        logger.exception(
+            "http.request.failed",
             extra={
-                "request_id": request_id,
-                "method": request.method,
-                "path": request.url.path,
-                "status_code": response.status_code,
-                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                "method": method,
+                "path": path,
+                "status_code": 500,
+                "duration_ms": elapsed_ms(started),
             },
+        )
+        raise
+    else:
+        response.headers["x-request-id"] = request_id
+        # For streamed responses this measures time to first byte, not stream length.
+        log_event(
+            logger,
+            "http.request.completed",
+            method=method,
+            path=path,
+            status_code=response.status_code,
+            duration_ms=elapsed_ms(started),
         )
         return response
     finally:
@@ -143,19 +178,6 @@ def _conversation_title_from_message(message: str) -> str:
 
 def _event(name: str, payload: dict[str, Any]) -> str:
     return f"event: {name}\ndata: {json.dumps(payload, default=str)}\n\n"
-
-
-def _citation_payload(chunks: list[SearchResult]) -> list[CitationResponse]:
-    unique_chunks = canonicalize_sources(chunks)
-    return [
-        CitationResponse(
-            document_id=chunk.document_id,
-            filename=chunk.filename,
-            chunk_id=chunk.chunk_id,
-            page_number=chunk.page_number,
-        )
-        for chunk in unique_chunks
-    ]
 
 
 @app.get("/health")
@@ -236,7 +258,7 @@ def login(
         try:
             password_valid = verify_password(credentials.password, user.password_hash)
         except Exception:
-            logger.warning("auth_password_verification_failed")
+            log_event(logger, "auth.password_verification_failed", level=logging.WARNING)
     if user is None or not password_valid or not user.active:
         audit(db, user, "auth.login_failed", "user", user.id if user else None)
         db.commit()
@@ -358,16 +380,18 @@ def get_conversation(
 
 
 @app.post("/documents", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
-async def upload_document(
+def upload_document(
     file: UploadFile = File(...),  # noqa: B008
     user: User = Depends(get_current_user),  # noqa: B008
     db: Session = Depends(get_db),  # noqa: B008
 ) -> Document:
+    # A sync handler runs in FastAPI's threadpool, so blocking file, database, and
+    # Redis work here does not stall the event loop.
     if not check_rate_limit("upload", str(user.id), 20, 60):
         audit(db, user, "rate_limit.denied", "user", user.id, {"scope": "upload"})
         db.commit()
         raise HTTPException(status_code=429, detail="Upload rate limit exceeded")
-    data = await file.read(settings.max_file_size + 1)
+    data = file.file.read(settings.max_file_size + 1)
     try:
         suffix = validate_upload(file, data, settings)
     except OverflowError as error:
@@ -401,12 +425,22 @@ async def upload_document(
         file_storage.delete(document.storage_key)
         audit(db, user, "document.upload_failed", "document", document_id, {"reason": "persist"})
         db.commit()
-        logger.exception("Could not persist document metadata")
+        logger.exception("document.persist_failed", extra={"document_id": str(document_id)})
         raise HTTPException(status_code=500, detail="Could not save document") from error
-    enqueue(document.id, settings)
-    logger.info(
-        "document_accepted",
-        extra={"document_id": str(document.id), "user_id": str(user.id), "suffix": suffix},
+    if not enqueue(document.id, settings):
+        # Without a queued job the document would sit in "uploaded" forever.
+        document.status = DocumentStatus.FAILED
+        document.error_message = "Processing queue unavailable; upload the document again."
+        audit(db, user, "document.queue_failed", "document", document.id)
+        db.commit()
+        db.refresh(document)
+    log_event(
+        logger,
+        "document.accepted",
+        document_id=str(document.id),
+        user_id=str(user.id),
+        suffix=suffix,
+        status=document.status.value,
     )
     return document
 
@@ -444,86 +478,6 @@ def get_document(
     return document
 
 
-def _search_owned_chunks(db: Session, user: User, query: str, top_k: int) -> list[SearchResult]:
-    started = time.monotonic()
-    query_vector = embedding_provider(settings).embed([query])[0]
-    base_query = (
-        select(DocumentChunk, Document.filename)
-        .join(Document, Document.id == DocumentChunk.document_id)
-        .where(Document.owner_id == user.id, Document.status == DocumentStatus.COMPLETED)
-    )
-    dialect_name = db.bind.dialect.name if db.bind is not None else "sqlite"
-    if dialect_name == "postgresql":
-        from pgvector.sqlalchemy import Vector
-
-        query_param = bindparam(
-            "query_embedding", value=query_vector, type_=Vector(settings.embedding_dimension)
-        )
-        distance = DocumentChunk.embedding.op("<=>")(query_param)
-        similarity: Any = (literal_column("1.0") - distance).label("similarity")
-        vector_rows = db.execute(
-            select(DocumentChunk, Document.filename, similarity)
-            .join(Document, Document.id == DocumentChunk.document_id)
-            .where(Document.owner_id == user.id, Document.status == DocumentStatus.COMPLETED)
-            .order_by(similarity.desc(), DocumentChunk.id.asc())
-            .limit(top_k)
-        ).all()
-        results = [
-            SearchResult(
-                document_id=chunk.document_id,
-                chunk_id=chunk.id,
-                filename=filename,
-                content=chunk.content,
-                page_number=chunk.page_number,
-                similarity=round(float(score), 6),
-            )
-            for chunk, filename, score in vector_rows
-            if float(score) >= settings.retrieval_similarity_threshold
-        ]
-        logger.info(
-            "rag_retrieval_completed",
-            extra={
-                "operation": "rag_retrieval",
-                "user_id": str(user.id),
-                "status": "completed",
-                "result_count": len(results),
-                "duration_ms": round((time.monotonic() - started) * 1000, 2),
-            },
-        )
-        return results
-    rows = db.execute(base_query).all()
-    scored = [
-        (
-            _cosine(query_vector, list(chunk.embedding)),
-            chunk,
-            filename,
-        )
-        for chunk, filename in rows
-    ]
-    scored.sort(key=lambda item: (-item[0], str(item[1].id)))
-    return [
-        SearchResult(
-            document_id=chunk.document_id,
-            chunk_id=chunk.id,
-            filename=filename,
-            content=chunk.content,
-            page_number=chunk.page_number,
-            similarity=round(score, 6),
-        )
-        for score, chunk, filename in scored[:top_k]
-        if score >= settings.retrieval_similarity_threshold
-    ]
-
-
-def _cosine(left: list[float], right: list[float]) -> float:
-    denominator = math.sqrt(sum(value * value for value in left)) * math.sqrt(
-        sum(value * value for value in right)
-    )
-    return (
-        sum(a * b for a, b in zip(left, right, strict=False)) / denominator if denominator else 0.0
-    )
-
-
 @app.post("/documents/search", response_model=list[SearchResult])
 def search_documents(
     request: SearchRequest,
@@ -531,7 +485,7 @@ def search_documents(
     db: Session = Depends(get_db),  # noqa: B008
 ) -> list[SearchResult]:
     top_k = request.top_k or settings.retrieval_top_k
-    return _search_owned_chunks(db, user, request.query, top_k)
+    return search_owned_chunks(db, user, request.query, top_k, settings)
 
 
 @app.post("/metrics/query", response_model=list[MetricResponse])
@@ -559,6 +513,15 @@ def list_metrics(
     return get_metric(db, service, name)
 
 
+def _service_error(error: Exception) -> HTTPException:
+    """Map domain exceptions to consistent HTTP semantics."""
+    if isinstance(error, PermissionError):
+        return HTTPException(status_code=403, detail=str(error))
+    if isinstance(error, LookupError):
+        return HTTPException(status_code=404, detail=str(error))
+    return HTTPException(status_code=409, detail=str(error))
+
+
 @app.post(
     "/incidents/proposals", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED
 )
@@ -568,43 +531,18 @@ def list_metrics(
     status_code=status.HTTP_201_CREATED,
     include_in_schema=False,
 )
-def create_incident_proposal(
-    payload: IncidentProposalCreate,
-    user: User = Depends(require_roles(UserRole.ADMIN)),  # noqa: B008
-    db: Session = Depends(get_db),  # noqa: B008
-) -> Incident:
-    if (
-        payload.conversation_id is not None
-        and db.scalar(
-            select(Conversation).where(
-                Conversation.id == payload.conversation_id, Conversation.user_id == user.id
-            )
-        )
-        is None
-    ):
-        audit(
-            db,
-            user,
-            "permission.denied",
-            "conversation",
-            payload.conversation_id,
-            {"operation": "incident.propose"},
-        )
-        db.commit()
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    try:
-        return propose(db, user, payload)
-    except PermissionError as error:
-        raise HTTPException(status_code=403, detail=str(error)) from error
-
-
 @app.post("/incidents", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED)
-def create_incident(
+def create_incident_proposal(
     payload: IncidentProposalCreate,
     user: User = Depends(require_roles(UserRole.ADMIN, UserRole.ANALYST)),  # noqa: B008
     db: Session = Depends(get_db),  # noqa: B008
 ) -> Incident:
-    return create_incident_proposal(payload, user, db)
+    # Conversation ownership and role checks live in the service so the API, agent,
+    # and MCP adapter enforce the same rules.
+    try:
+        return propose(db, user, payload)
+    except (PermissionError, LookupError) as error:
+        raise _service_error(error) from error
 
 
 @app.get("/incidents", response_model=list[IncidentResponse])
@@ -612,12 +550,10 @@ def list_incidents(
     user: User = Depends(require_roles(UserRole.ADMIN, UserRole.ANALYST)),  # noqa: B008
     db: Session = Depends(get_db),  # noqa: B008
 ) -> list[Incident]:
-    statement = select(Incident)
+    statement = select(Incident).options(selectinload(Incident.actions))
     if user.role != UserRole.ADMIN:
         statement = statement.where(Incident.owner_id == user.id)
-    return list(
-        db.scalars(statement.order_by(Incident.created_at.desc()).limit(100)).unique().all()
-    )
+    return list(db.scalars(statement.order_by(Incident.created_at.desc()).limit(100)).all())
 
 
 @app.get("/incidents/{incident_id}", response_model=IncidentResponse)
@@ -676,7 +612,7 @@ def approve(
     try:
         return approve_action(db, action, user, payload.decision, idempotency_key)
     except (PermissionError, ValueError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+        raise _service_error(error) from error
 
 
 @app.get("/actions/{action_id}/approvals", response_model=list[ApprovalResponse])
@@ -709,7 +645,7 @@ def execute(
     try:
         return execute_action(db, action, user)
     except (PermissionError, ValueError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+        raise _service_error(error) from error
 
 
 @app.get("/audit-logs", response_model=list[AuditLogResponse])
@@ -717,7 +653,11 @@ def list_audit_logs(
     user: User = Depends(require_roles(UserRole.ADMIN, UserRole.ANALYST)),  # noqa: B008
     db: Session = Depends(get_db),  # noqa: B008
 ) -> list[AuditLog]:
-    return list(db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(200)).all())
+    statement = select(AuditLog)
+    if user.role != UserRole.ADMIN:
+        # Analysts see their own trail; the global log exposes other users' identifiers.
+        statement = statement.where(AuditLog.actor_id == user.id)
+    return list(db.scalars(statement.order_by(AuditLog.created_at.desc()).limit(200)).all())
 
 
 @app.post("/mcp")
@@ -770,107 +710,50 @@ def send_message(
     conversation.updated_at = func.now()
     db.commit()
 
-    recent_history = list(
+    history = list(
         db.scalars(
             select(Message)
-            .where(Message.conversation_id == conversation.id)
+            .where(Message.conversation_id == conversation.id, Message.id != user_message.id)
             .order_by(Message.created_at.desc(), Message.id.desc())
-            .limit(10)
+            .limit(4)
         ).all()
     )
-    recent_history.reverse()
+    history_lines = [f"{message.role}: {message.content}" for message in reversed(history)]
+    conversation_id = conversation.id
+    question = user_message.content
 
-    retrieved_chunks = _search_owned_chunks(db, user, payload.content, settings.retrieval_top_k)
-    max_similarity = max((chunk.similarity for chunk in retrieved_chunks), default=0.0)
-    grounded_chunks = (
-        [] if max_similarity < settings.retrieval_similarity_threshold else retrieved_chunks
-    )
-    citations = _citation_payload(grounded_chunks)
-    provider = get_chat_provider(settings)
+    def save_reply(collected: list[str]) -> None:
+        content = "".join(collected).strip()
+        if content:
+            db.add(Message(conversation_id=conversation_id, role="assistant", content=content))
+            db.commit()
 
-    def stream_response() -> Any:
+    def stream_response() -> Iterator[str]:
         collected: list[str] = []
         try:
-            intent = parse_intent(payload.content)
-            if should_handle(payload.content):
-                for event_name, event_payload in stream_agent(
-                    payload.content, db, user, conversation_id=conversation.id
-                ):
-                    if event_name == "token":
-                        collected.append(str(event_payload.get("text", "")))
-                    yield _event(event_name, event_payload)
-                assistant_message = Message(
-                    conversation_id=conversation.id,
-                    role="assistant",
-                    content="".join(collected).strip(),
-                )
-                db.add(assistant_message)
-                db.commit()
-                return
-            if intent.kind == IntentKind.NONE:
-                response_text = "Hi! Ask me about your uploaded documents or service metrics."
-                for token in response_text.split():
-                    collected.append(f"{token} ")
-                    yield _event("token", {"text": f"{token} "})
-                assistant_message = Message(
-                    conversation_id=conversation.id,
-                    role="assistant",
-                    content=response_text,
-                )
-                db.add(assistant_message)
-                db.commit()
-                yield _event("done", {"status": "completed"})
-                return
-            yield _event(
-                "tool_call",
-                {"name": "search_knowledge", "arguments": {"query": payload.content}},
+            for event_name, event_payload in stream_reply(
+                db, user, conversation_id, question, history_lines, settings
+            ):
+                if event_name == "token":
+                    collected.append(str(event_payload.get("text", "")))
+                elif event_name == "done":
+                    # Persist before signalling completion so a reload shows the reply.
+                    save_reply(collected)
+                yield _event(event_name, event_payload)
+        except Exception:
+            # Headers are already sent, so report the failure in-band instead of raising.
+            db.rollback()
+            logger.exception(
+                "chat.failed",
+                extra={"conversation_id": str(conversation_id), "user_id": str(user.id)},
             )
-            yield _event(
-                "tool_result",
-                {
-                    "name": "search_knowledge",
-                    "result": {"count": len(retrieved_chunks)},
-                    "read_only": True,
-                },
-            )
-            if not retrieved_chunks or max_similarity < settings.retrieval_similarity_threshold:
-                response_text = (
-                    "I couldn't find enough information in your uploaded documents to answer that."
-                )
-                for token in response_text.split():
-                    collected.append(f"{token} ")
-                    yield _event("token", {"text": f"{token} "})
-                assistant_message = Message(
-                    conversation_id=conversation.id,
-                    role="assistant",
-                    content=response_text,
-                )
-                db.add(assistant_message)
-                db.commit()
-                yield _event("done", {"status": "completed"})
-                return
-
-            history_lines = [
-                f"{message.role}: {message.content}" for message in recent_history[-4:]
-            ]
-            for token in provider.stream(payload.content, grounded_chunks, history_lines):
-                collected.append(token)
-                yield _event("token", {"text": token})
-            assistant_message = Message(
-                conversation_id=conversation.id,
-                role="assistant",
-                content="".join(collected).strip(),
-            )
-            db.add(assistant_message)
+            audit(db, user, "chat.failed", "conversation", conversation_id)
             db.commit()
-            citations_payload = [item.model_dump(mode="json") for item in citations]
-            yield _event("citation", {"citations": citations_payload})
-            yield _event("done", {"status": "completed", "citations": citations_payload})
-        except Exception as error:  # pragma: no cover - defensive path
-            audit(db, user, "chat.failed", "conversation", conversation.id)
-            db.commit()
-            logger.exception("Chat generation failed for conversation %s", conversation.id)
             yield _event("error", {"message": "I couldn't complete that response right now."})
-            raise HTTPException(status_code=500, detail="Chat generation failed") from error
+            yield _event("done", {"status": "failed"})
 
-    return StreamingResponse(stream_response(), media_type="text/event-stream")
+    return StreamingResponse(
+        stream_response(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

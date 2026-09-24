@@ -92,6 +92,13 @@ class SearchResult(BaseModel):
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=20000)
 
+    @field_validator("content")
+    @classmethod
+    def content_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Message must not be blank")
+        return value
+
 
 class MessageResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -155,6 +162,9 @@ class MetricsQuery(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
 
 
+RESTARTABLE_SERVICES = frozenset({"api", "worker", "web"})
+
+
 class ProposedAction(BaseModel):
     kind: Literal["restart_service", "rollback_deployment"]
     parameters: dict[str, object] = Field(default_factory=dict)
@@ -166,13 +176,7 @@ class ProposedAction(BaseModel):
             raise ValueError("Action parameters are not allowed for this action")
         service = self.parameters.get("service")
         if self.kind == "restart_service" and (
-            not isinstance(service, str)
-            or service
-            not in {
-                "api",
-                "worker",
-                "web",
-            }
+            not isinstance(service, str) or service not in RESTARTABLE_SERVICES
         ):
             raise ValueError("A restart action requires an allowed service")
         if self.kind == "rollback_deployment" and not isinstance(

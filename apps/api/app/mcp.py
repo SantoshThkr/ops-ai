@@ -1,4 +1,9 @@
-"""Authenticated JSON-RPC adapter over the same API services."""
+"""Authenticated MCP-style JSON-RPC adapter over the same API services.
+
+This implements a `tools/list` and `tools/call` subset over a single authenticated
+HTTP endpoint. It is not a full Model Context Protocol server: there is no
+`initialize` handshake, capability negotiation, batching, or notifications.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.incidents import audit, get_incident, propose
 from app.models import User, UserRole
+from app.observability import elapsed_ms, log_event
 from app.schemas import IncidentProposalCreate
 from app.tools import get_metric, search_knowledge, tool_catalog
 
@@ -30,14 +36,15 @@ def _failed(
     code: int = -32602,
     tool: str | None = None,
 ) -> dict[str, Any]:
-    logger.warning(
-        "mcp_request_failed",
-        extra={
-            "operation": "mcp_request",
-            "tool": tool,
-            "user_id": str(user.id),
-            "status": "failed",
-        },
+    log_event(
+        logger,
+        "mcp.request.failed",
+        level=logging.WARNING,
+        operation="mcp_request",
+        tool=tool[:120] if tool else None,
+        user_id=str(user.id),
+        status="failed",
+        error_code=code,
     )
     audit(
         db,
@@ -58,14 +65,13 @@ def handle_request(request: dict[str, Any], db: Session, user: User) -> dict[str
         return _failed(request_id, db, user, "Invalid JSON-RPC request", code=-32600)
     method = request.get("method")
     if method == "tools/list":
-        logger.info(
-            "mcp_request_completed",
-            extra={
-                "operation": "mcp_tools_list",
-                "user_id": str(user.id),
-                "status": "completed",
-                "duration_ms": round((time.monotonic() - started) * 1000, 2),
-            },
+        log_event(
+            logger,
+            "mcp.request.completed",
+            operation="mcp_tools_list",
+            user_id=str(user.id),
+            status="completed",
+            duration_ms=elapsed_ms(started),
         )
         return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": tool_catalog()}}
     if method != "tools/call":
@@ -95,7 +101,11 @@ def handle_request(request: dict[str, Any], db: Session, user: User) -> dict[str
                 ]
             }
         elif name == "get_metric":
-            metrics = get_metric(db, arguments.get("service"), arguments.get("name"))
+            service = arguments.get("service")
+            metric_name = arguments.get("name")
+            if not all(value is None or isinstance(value, str) for value in (service, metric_name)):
+                return _failed(request_id, db, user, "service and name must be strings", tool=name)
+            metrics = get_metric(db, service, metric_name)
             result = {
                 "metrics": [item.model_dump(mode="json") for item in metrics],
                 "metric": metrics[0].model_dump(mode="json") if metrics else None,
@@ -143,34 +153,39 @@ def handle_request(request: dict[str, Any], db: Session, user: User) -> dict[str
             }
         else:
             return _failed(request_id, db, user, "Unknown tool", tool=name)
+    except (PermissionError, LookupError) as error:
+        db.rollback()
+        audit(db, user, "mcp.tool_denied", "tool", name, {"reason": str(error)[:200]})
+        db.commit()
+        return _error(request_id, -32003, str(error))
     except (TypeError, ValueError):
+        db.rollback()
         audit(db, user, "mcp.tool_failed", "tool", name)
         db.commit()
         return _error(request_id, -32602, "Invalid tool arguments")
     except Exception:
         logger.exception(
-            "mcp_tool_failed",
+            "mcp.tool.failed",
             extra={
                 "operation": "mcp_tool_call",
                 "tool": name,
                 "user_id": str(user.id),
                 "status": "failed",
-                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                "duration_ms": elapsed_ms(started),
             },
         )
         db.rollback()
         audit(db, user, "mcp.tool_failed", "tool", name)
         db.commit()
         return _error(request_id, -32000, "Tool execution failed")
-    logger.info(
-        "mcp_tool_completed",
-        extra={
-            "operation": "mcp_tool_call",
-            "tool": name,
-            "user_id": str(user.id),
-            "status": "completed",
-            "duration_ms": round((time.monotonic() - started) * 1000, 2),
-        },
+    log_event(
+        logger,
+        "mcp.tool.completed",
+        operation="mcp_tool_call",
+        tool=name,
+        user_id=str(user.id),
+        status="completed",
+        duration_ms=elapsed_ms(started),
     )
     return {
         "jsonrpc": "2.0",

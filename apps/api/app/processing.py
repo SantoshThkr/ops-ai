@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from uuid import UUID
 
 from sqlalchemy import delete, select
@@ -18,8 +19,13 @@ from app.ingestion import (
     storage,
 )
 from app.models import Document, DocumentChunk, DocumentStatus
+from app.observability import elapsed_ms, log_event
 
 logger = logging.getLogger(__name__)
+
+
+class UnreadableDocumentError(ValueError):
+    """The file was valid but contained no extractable text (for example, a scanned PDF)."""
 
 
 def process_document(
@@ -31,6 +37,7 @@ def process_document(
     settings: Settings | None = None,
 ) -> bool:
     settings = settings or get_settings()
+    started = time.monotonic()
     document = db.scalar(select(Document).where(Document.id == document_id))
     if document is None or document.status == DocumentStatus.COMPLETED:
         return document is not None
@@ -44,7 +51,7 @@ def process_document(
         pages = extract_text(file_storage.read(document.storage_key), suffix)
         chunks = chunk_text(pages, settings.chunk_size, settings.chunk_overlap)
         if not chunks:
-            raise ValueError("No readable text found")
+            raise UnreadableDocumentError("No readable text found in the document")
         vectors = embeddings.embed([item[0] for item in chunks])
         if len(vectors) != len(chunks):
             raise ValueError("Embedding provider returned an invalid result")
@@ -62,13 +69,33 @@ def process_document(
         )
         document.status = DocumentStatus.COMPLETED
         db.commit()
+        log_event(
+            logger,
+            "document.processing.completed",
+            document_id=str(document_id),
+            status="completed",
+            chunk_count=len(chunks),
+            duration_ms=elapsed_ms(started),
+        )
         return True
-    except Exception:
+    except Exception as error:
         db.rollback()
         document = db.scalar(select(Document).where(Document.id == document_id))
         if document is not None:
             document.status = DocumentStatus.FAILED
-            document.error_message = "Document processing failed"
+            # Only our own validation messages are shown to users; parser errors stay in logs.
+            document.error_message = (
+                str(error)
+                if isinstance(error, UnreadableDocumentError)
+                else "Document processing failed"
+            )
             db.commit()
-        logger.exception("Document %s processing failed", document_id)
+        logger.exception(
+            "document.processing.failed",
+            extra={
+                "document_id": str(document_id),
+                "status": "failed",
+                "duration_ms": elapsed_ms(started),
+            },
+        )
         return False

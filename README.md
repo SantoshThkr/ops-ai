@@ -1,141 +1,163 @@
 # OpsAI
 
-OpsAI is a production-style AI operations platform demonstrating grounded
-knowledge retrieval, read-only service metrics, and approval-gated incident
-workflows. It is designed to run locally with deterministic providers and does
-not require an OpenAI API key.
+OpsAI is a production-style AI operations platform: grounded answers from your own
+documents, read-only service metrics, and approval-gated incident workflows. It runs
+locally with deterministic providers and does not require an OpenAI API key.
 
 ## Problem
 
-Operations teams need answers grounded in internal documents and recorded
-service data, while operational mutations must remain controlled, auditable,
-and permission-aware.
+Operations teams need answers grounded in internal documents and recorded service data,
+while operational changes must stay controlled, auditable, and permission-aware.
 
 ## Solution
 
-OpsAI combines an authenticated Next.js frontend with a FastAPI backend, an
-owner-scoped RAG pipeline, typed allowlisted tools, RBAC, approval gates,
-idempotent action execution, audit logs, Redis rate limiting, and an
-authenticated MCP-style JSON-RPC adapter.
+An authenticated Next.js frontend talks to a FastAPI backend with an owner-scoped RAG
+pipeline, a deterministic agent that can only call typed allowlisted tools, RBAC,
+proposal → approval → execution for mutations, idempotent execution, audit logs, Redis
+rate limiting, structured request-correlated logs, and an authenticated MCP-style
+JSON-RPC adapter.
 
 ## Architecture
 
 ```text
-Browser
-  -> Next.js frontend
-  -> FastAPI API
-  -> controlled deterministic agent
-  -> typed allowlisted tools
-  -> RAG / metrics / incidents
-  -> approval gate
-  -> audit log
-  -> PostgreSQL + pgvector
-  -> Redis
+Browser (Next.js, SSE)
+  -> FastAPI routes          auth, validation, HTTP semantics, SSE framing
+  -> chat orchestration      app/chat.py: routes each message to the agent or RAG
+  -> deterministic agent     app/agent.py: typed intents, no free-form tool calls
+  -> allowlisted tools       app/tools.py: search_knowledge, get_metric, get_incident, create_incident
+  -> domain services         app/retrieval.py, app/incidents.py (approval gate, idempotency, audit)
+  -> PostgreSQL + pgvector   system of record; Redis for the job queue and rate limits
 ```
 
-- `apps/web`: Next.js, React, TypeScript, Tailwind CSS, and SSE chat UI
-- `apps/api`: FastAPI, SQLAlchemy, Alembic, authentication, agent, tools, and workflows
-- `packages/shared`: intentionally small shared TypeScript contracts
+- `apps/web`: Next.js, React, TypeScript, Tailwind CSS
+- `apps/api`: FastAPI, SQLAlchemy, Alembic, agent, tools, worker, evaluation
+- `packages/shared`: small shared TypeScript constants
 - `infra/docker`: PostgreSQL/pgvector, Redis, API, worker, and web containers
-- `docs`: architecture documentation
-
-PostgreSQL is the durable system of record and stores documents, chunks,
-conversations, metrics, incidents, approvals, and audit events. Redis carries
-document-processing jobs and supports rate limiting. Uploaded files use generated
-storage keys outside the source tree.
+- `docs/architecture.md`: boundaries, request flows, and the approval state machine
 
 ## Security and control boundaries
 
-The API owns validation, authorization, business logic, and persistence. The
-frontend never decides permissions. Viewer users cannot propose incidents;
-analysts and administrators can propose; administrators alone approve and
-execute. Mutating actions require an unexpired approval and are protected by
-database-backed idempotency.
+The API owns validation, authorization, business logic, and persistence; the frontend
+only hides controls a user cannot use. Roles:
 
-The four tools are:
+| Capability | Viewer | Analyst | Admin |
+| --- | --- | --- | --- |
+| Upload and search own documents, chat, read metrics | ✓ | ✓ | ✓ |
+| Propose incidents (API, chat, MCP) | | ✓ | ✓ |
+| Read incidents and actions | | own | all |
+| Approve, reject, execute actions | | | ✓ |
+| Read audit log | | own events | all |
 
-| Tool | Purpose | Mutation |
-| --- | --- | --- |
-| `search_knowledge` | Owner-scoped document retrieval | No |
-| `get_metric` | Read an allowlisted recorded metric | No |
-| `get_incident` | Read an authorized incident | No |
-| `create_incident` | Create an approval-required proposal | Proposal only |
+Mutations follow **proposal → approval → execution**. An action needs an unexpired
+administrator approval before it can run. Approval and execution lock the action row
+and re-read it, so concurrent requests cannot approve and reject the same action or
+execute it twice (covered by Postgres integration tests). Rejected and expired actions
+never execute. Permission failures return 403, missing or foreign resources 404, and
+state conflicts 409.
 
-Tool names and arguments are validated against an allowlist. Every important
-workflow writes audit events. Authentication uses HTTP-only cookies, request
-IDs are correlated in logs, and Redis rate limiting fails safely according to
-its documented local-development behavior.
+Authentication uses HTTP-only, `SameSite=Lax` cookies carrying a short-lived JWT; the
+role is read from the database on every request, never trusted from the token. With
+`APP_ENV=production` the API refuses to start if `JWT_SECRET` is a placeholder or
+shorter than 32 characters, or if `AUTH_COOKIE_SECURE` is false.
 
-The API exposes an authenticated **MCP-style JSON-RPC adapter** at `POST /mcp`.
-It reuses the same service and tool implementations; it is not described as a
-standards-certified MCP server.
+`POST /mcp` is an authenticated **MCP-style JSON-RPC adapter**. It supports
+`tools/list` and `tools/call` over the same services and RBAC as the API. It is not a
+full Model Context Protocol server: there is no `initialize` handshake, capability
+negotiation, batching, or notifications.
 
-## Agent and approval workflow
+## Agent routing
 
-The local agent uses typed deterministic intent routing. Knowledge requests use
-owner-scoped retrieval and similarity thresholding. Metric requests only read
-persisted allowlisted values. Incident requests create proposals and stream
-`approval_required` activity; no external side effect occurs before approval.
+The local agent is deterministic and intentionally conservative:
+
+| Message | Behavior |
+| --- | --- |
+| “What is the latency?” / “what metrics are available?” | `get_metric` (read-only) |
+| “Create an incident and restart the api service” | `create_incident` proposal with `restart_service{service: api}`; approval required |
+| “Create an incident because latency is high” | Proposal with **no** action attached; nothing can run |
+| “Create an incident and restart the database” | Proposal with no action; the reply explains that only `api`, `worker`, and `web` can be restarted |
+| “Can you restart the API?” / “roll back the deployment” | Declined with guidance; no tool runs |
+| “Why did we roll back yesterday?” / “don’t create an incident” | Treated as a question; searches documents; no incident is created |
+| “Show me incident `<uuid>`” | `get_incident` (owner or admin only) |
+| Anything else | Owner-scoped document search, or a short capabilities message |
+
+Only an explicit, non-negated request to create an incident can reach the
+proposal-only mutation tool, and actions are attached only for supported actions with an
+allowlisted target named in the message. Rollbacks need a deployment identifier, so they
+are proposed through the incidents API rather than chat.
 
 ## Demo flow
 
-1. Register and upload a PDF, TXT, or Markdown document.
-2. Ask a grounded question about the uploaded document and inspect citations.
-3. Ask a metric question such as “What is the latency?”
-4. Confirm a viewer is denied when requesting an incident mutation.
-5. Use an analyst account to create an incident proposal.
-6. Use an administrator account to approve the action.
-7. Execute the approved action as an administrator.
-8. Inspect the resulting audit record through the API.
+```bash
+cp .env.example .env            # then replace the placeholder values
+docker compose --env-file .env -f infra/docker/docker-compose.yml up --build -d
+```
+
+1. Register three accounts in the web app (every new account is a viewer).
+2. Promote two of them and seed demo metrics (labelled `demo-seed`, not live telemetry):
+
+   ```bash
+   docker compose --env-file .env -f infra/docker/docker-compose.yml exec api python -m app.manage set-role analyst@example.com analyst
+   docker compose --env-file .env -f infra/docker/docker-compose.yml exec api python -m app.manage set-role admin@example.com admin
+   docker compose --env-file .env -f infra/docker/docker-compose.yml exec api python -m app.manage seed-demo-metrics
+   ```
+
+3. Upload a PDF, TXT, or Markdown document; its status updates as the worker processes it.
+4. Ask a question about it and inspect the quoted excerpt and sources.
+5. Ask “What is the latency?”.
+6. As a viewer, ask to create an incident and see the permission error.
+7. As the analyst, ask “Create an incident and restart the api service”.
+8. As the administrator, open **Incidents and approvals**, approve, then execute.
+9. Inspect `GET /audit-logs` (analysts see only their own events).
 
 ## Evaluation and observability
-
-The offline evaluator exercises deterministic behavior for knowledge context
-gating, metrics, incident lifecycle and idempotency, RBAC, and MCP requests:
 
 ```bash
 cd apps/api
 python -m app.evaluation
 ```
 
-It reports total cases, passed, failed, pass rate, category, case name,
-expected behavior, and actual behavior. This is regression evaluation, not LLM
-quality scoring. Structured logs include request IDs, operation/tool, user,
-status, resource identifiers, and useful durations without logging credentials,
-tokens, cookies, API keys, or document contents.
+The evaluator runs 31 deterministic cases against real code paths in an in-memory
+database: document processing and local-embedding retrieval (grounding, off-topic
+rejection, owner isolation, extractive quoting), intent routing, agent mutation safety,
+the approval lifecycle, and MCP error handling. It is regression evaluation of behavior
+contracts, not a measure of language-model answer quality.
 
-`/health` is a cheap liveness/database check. `/ready` checks database and Redis
-availability and is suitable for dependency-aware routing decisions.
+Application logs from the API and worker are JSON lines with `timestamp`, `level`,
+`logger`, `event` (for example `http.request.completed`, `rag.retrieval.completed`,
+`tool.completed`, `incident.executed`), a `request_id` shared by every event in a
+request, and fields such as `user_id`, `tool`, `status`, `result_count`, and
+`duration_ms`. Keys that look like passwords, tokens, cookies, or secrets are redacted,
+and document contents and message text are never logged. A caller-supplied
+`X-Request-ID` is reused only if it is short and log-safe. (Alembic migration output
+and uvicorn's startup messages remain plain text.)
+
+`/health` checks the API and database (liveness). `/ready` also checks Redis.
 
 ## Local development
 
-1. Copy the safe template and replace placeholders:
+Docker Compose (recommended):
 
-   ```bash
-   cp .env.example .env
-   ```
+1. `cp .env.example .env`, then set `POSTGRES_PASSWORD` (also in `DATABASE_URL`) and a
+   `JWT_SECRET` of at least 32 random characters.
+2. `docker compose --env-file .env -f infra/docker/docker-compose.yml up --build`
+3. Open http://localhost:3000 (web), http://localhost:8000/docs (API),
+   http://localhost:8000/health and http://localhost:8000/ready.
 
-2. Set a long random `JWT_SECRET`. Keep `AUTH_COOKIE_SECURE=false` only for
-   local HTTP development; use `true` behind HTTPS.
+Postgres and Redis are published on `127.0.0.1` only. Change host ports with `API_PORT`,
+`WEB_PORT`, `POSTGRES_PORT`, and `REDIS_PORT`. If you change the API port or host, also
+update `NEXT_PUBLIC_API_URL` (inlined into the web bundle at build time, so rebuild the
+web image) and `CORS_ORIGINS`.
 
-3. Start the stack:
-
-   ```bash
-   docker compose --env-file .env -f infra/docker/docker-compose.yml up --build
-   ```
-
-4. Open:
-
-   - Web: http://localhost:3000
-   - API docs: http://localhost:8000/docs
-   - Liveness: http://localhost:8000/health
-   - Readiness: http://localhost:8000/ready
-
-Run migrations manually when developing the API outside Compose:
+Running the API and worker on the host, with Postgres and Redis from Compose:
 
 ```bash
 cd apps/api
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+set -a && source ../../.env && set +a   # export DATABASE_URL, REDIS_URL, JWT_SECRET, ...
 alembic upgrade head
+uvicorn app.main:app --reload           # API on :8000
+python -m app.worker                    # in a second shell
 ```
 
 ## Testing and CI/CD
@@ -144,52 +166,82 @@ Backend:
 
 ```bash
 cd apps/api
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-pytest
-ruff check app tests
-ruff format --check app tests
-mypy app
+pytest                      # SQLite-backed unit and API tests
+ruff check app tests && ruff format --check app tests && mypy app
+python -m app.evaluation
+```
+
+Postgres-only behavior (pgvector search, row locking under concurrency) is covered by
+`tests/test_postgres_integration.py`, which is skipped unless `TEST_DATABASE_URL` is set:
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg://opsai:<password>@localhost:5432/opsai pytest tests/test_postgres_integration.py
 ```
 
 Frontend:
 
 ```bash
 npm ci
-npm run test:web
-npm run lint:web
-npm run typecheck:web
-npm run build:web
+npm run test:web && npm run lint:web && npm run typecheck:web && npm run build:web
 ```
 
-GitHub Actions in `.github/workflows/ci.yml` runs these backend and frontend
-checks on every push and pull request. CI uses local deterministic behavior and
-requires no paid AI service, API key, or external runtime dependency.
+GitHub Actions (`.github/workflows/ci.yml`) runs four jobs on every push and pull
+request: backend checks, tests, and the evaluator; a Postgres job that applies
+migrations, runs `alembic check` for model drift, tests a full downgrade and re-upgrade,
+and runs the Postgres integration tests; the frontend checks and production build; and
+Compose validation against `.env.example`. CI needs no paid AI service or API key.
+
+## Troubleshooting
+
+- **Port already in use**: set `API_PORT`, `WEB_PORT`, `POSTGRES_PORT`, or `REDIS_PORT`
+  in `.env`, and keep `NEXT_PUBLIC_API_URL` and `CORS_ORIGINS` consistent.
+- **The browser calls the wrong API URL**: `NEXT_PUBLIC_API_URL` is baked in at build
+  time; rebuild with `up --build`.
+- **Document stuck in `processing`**: the queue is at-most-once; if the worker stopped
+  mid-job, upload the document again. If Redis was unavailable at upload time, the
+  document is marked `failed` with a message asking you to re-upload.
+- **Signed out after about 30 minutes**: tokens expire after `JWT_EXPIRE_MINUTES`; there
+  is no refresh token.
+- **The API refuses to start**: with `APP_ENV=production`, the log line names the
+  unsafe setting.
 
 ## Key engineering decisions
 
-- deterministic local providers keep development and CI reproducible
-- retrieval is owner-scoped and thresholded before citations are emitted
-- typed allowlists prevent arbitrary tool or SQL routing
-- approval-before-mutation separates proposal from execution
-- database locking and idempotency protect repeated actions
-- audit logs and request-correlated structured logs support investigation
-- the MCP-style adapter reuses existing authorization and service boundaries
-- the evaluation suite tests behavior rather than inventing model-quality scores
+- Deterministic local providers keep development, tests, and CI reproducible.
+- Retrieval is owner-scoped and thresholded before any citation is emitted.
+- Typed allowlists prevent arbitrary tool, action, target, or SQL selection.
+- Mutations are proposals first; execution requires an unexpired administrator approval.
+- Row locks plus a fresh re-read make approval and execution safe under concurrency.
+- The API, agent, and MCP adapter share one service layer, so RBAC is enforced once.
+- The evaluator checks behavior contracts instead of inventing model-quality scores.
 
 ## Limitations
 
-The local provider is deterministic and intentionally limited; it is not a
-general-purpose production LLM. Incident execution is a persisted local
-execution boundary and does not integrate with external ticketing or cloud
-operations systems. The repository includes practical local Docker and CI
-preparation, but deployment, secret management, TLS termination, backups,
-scaling, and production monitoring remain infrastructure responsibilities.
+- **Local retrieval is lexical, not semantic.** The default embedding is a hashed
+  bag of words: it matches exact word forms and cannot match paraphrases or synonyms.
+  For example, against a note that says “The VPN is configured with…”, the question
+  “How is the VPN configured?” scores 0.48 but “How do I configure the VPN?” scores
+  0.22, below the 0.35 threshold. Function words can also push unrelated questions over
+  the threshold, so the local provider additionally requires at least one shared content
+  word (prefix match) before a chunk counts as grounded. Improving recall (full-text
+  ranking in Postgres, or a real embedding model behind the existing provider interface)
+  needs a labelled evaluation set first, which the project does not have yet.
+- **Local answers are extractive.** They quote the most relevant retrieved sentences
+  with their source; they do not summarize or reason across documents. Set
+  `CHAT_PROVIDER=openai` and `OPENAI_API_KEY` for generated answers (optional, untested
+  in CI).
+- **Execution is a persisted boundary.** Approved actions are recorded as executed; no
+  external system is called. There is no separation of duties yet: an administrator can
+  approve their own proposal.
+- **Queue delivery is at-most-once.** A worker crash mid-job leaves that document in
+  `processing`.
+- **Sessions are stateless JWTs.** Logout clears the cookie but does not revoke a copied
+  token before it expires.
+- Deployment concerns such as TLS termination, secret management, backups, scaling, and
+  metrics or tracing backends are out of scope for this repository.
 
 ## Configuration
 
-`.env.example` contains placeholders only. `.env` is ignored by Git. Database,
-Redis, JWT, cookie, storage, retrieval, provider, and frontend API settings are
-configurable through environment variables. The local provider defaults remain
-safe for offline development.
+`.env.example` contains placeholders only; `.env` is git-ignored. All settings are
+environment variables (see `apps/api/app/config.py`). Defaults are safe for offline
+development, and `APP_ENV=production` turns insecure defaults into a startup failure.

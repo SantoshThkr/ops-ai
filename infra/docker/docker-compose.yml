@@ -5,8 +5,9 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-opsai}
       POSTGRES_USER: ${POSTGRES_USER:-opsai}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    # Published on loopback only, for running the API or migrations from the host.
     ports:
-      - '5432:5432'
+      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -18,38 +19,51 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
+    # Redis has no password in local development, so never publish it beyond loopback.
     ports:
-      - '6379:6379'
+      - '127.0.0.1:${REDIS_PORT:-6379}:6379'
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   api:
     build:
       context: ../..
       dockerfile: infra/docker/api.Dockerfile
     environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-opsai}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-opsai}
       REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-30}
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
-      STORAGE_DIR: ${STORAGE_DIR:-/data/documents}
+      # Must match the shared volume mount; STORAGE_DIR in .env is for host development.
+      STORAGE_DIR: /data/documents
       MAX_FILE_SIZE: ${MAX_FILE_SIZE:-10485760}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-local-hash}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
+      RETRIEVAL_SIMILARITY_THRESHOLD: ${RETRIEVAL_SIMILARITY_THRESHOLD:-0.35}
       QUEUE_NAME: ${QUEUE_NAME:-opsai:document-processing}
+      CHAT_PROVIDER: ${CHAT_PROVIDER:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
     volumes:
       - document_storage:/data/documents
     ports:
-      - '8000:8000'
+      - '${API_PORT:-8000}:8000'
     healthcheck:
       test:
         [
@@ -64,19 +78,25 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    restart: unless-stopped
 
   worker:
     build:
       context: ../..
       dockerfile: infra/docker/api.Dockerfile
-    command: ["python", "-m", "app.worker"]
+    command: ['python', '-m', 'app.worker']
     environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-opsai}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-opsai}
       REDIS_URL: redis://redis:6379/0
-      STORAGE_DIR: ${STORAGE_DIR:-/data/documents}
+      # Must match the shared volume mount; STORAGE_DIR in .env is for host development.
+      STORAGE_DIR: /data/documents
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-local-hash}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       CHUNK_SIZE: ${CHUNK_SIZE:-1000}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
       QUEUE_NAME: ${QUEUE_NAME:-opsai:document-processing}
@@ -89,15 +109,17 @@ services:
         condition: service_healthy
       api:
         condition: service_healthy
+    restart: unless-stopped
 
   web:
     build:
       context: ../..
       dockerfile: infra/docker/web.Dockerfile
-    environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      args:
+        # Inlined into the browser bundle at build time; rebuild after changing it.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     ports:
-      - '3000:3000'
+      - '${WEB_PORT:-3000}:3000'
     healthcheck:
       test:
         [
@@ -112,6 +134,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:

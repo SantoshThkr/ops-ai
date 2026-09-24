@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import ServiceMetric, User
+from app.observability import elapsed_ms, log_event
+from app.retrieval import search_owned_chunks
 from app.schemas import MetricResponse, SearchResult
 
 logger = logging.getLogger(__name__)
@@ -51,36 +53,32 @@ def search_knowledge(
     query: str,
     top_k: int | None = None,
 ) -> list[SearchResult]:
-    from app.main import _search_owned_chunks
-
     settings = get_settings()
     requested = top_k or settings.retrieval_top_k
     started = time.monotonic()
     try:
-        rows = _search_owned_chunks(db, user, query, max(1, min(requested, 50)))
-        results = [row for row in rows if row.similarity >= settings.retrieval_similarity_threshold]
+        results = search_owned_chunks(db, user, query, max(1, min(requested, 50)), settings)
     except Exception:
-        logger.exception(
-            "tool_failed",
-            extra={
-                "operation": "tool_execution",
-                "tool": "search_knowledge",
-                "user_id": str(user.id),
-                "status": "failed",
-                "duration_ms": round((time.monotonic() - started) * 1000, 2),
-            },
+        log_event(
+            logger,
+            "tool.failed",
+            level=logging.ERROR,
+            tool="search_knowledge",
+            user_id=str(user.id),
+            status="failed",
+            duration_ms=elapsed_ms(started),
         )
         raise
-    logger.info(
-        "tool_completed",
-        extra={
-            "operation": "tool_execution",
-            "tool": "search_knowledge",
-            "user_id": str(user.id),
-            "status": "completed",
-            "result_count": len(results),
-            "duration_ms": round((time.monotonic() - started) * 1000, 2),
-        },
+    # search_owned_chunks already thresholds; this keeps the tool contract explicit.
+    results = [row for row in results if row.similarity >= settings.retrieval_similarity_threshold]
+    log_event(
+        logger,
+        "tool.completed",
+        tool="search_knowledge",
+        user_id=str(user.id),
+        status="completed",
+        result_count=len(results),
+        duration_ms=elapsed_ms(started),
     )
     return results
 
@@ -90,25 +88,14 @@ def get_metric(
     service: str | None = None,
     name: str | None = None,
 ) -> list[MetricResponse]:
-    logger.info(
-        "tool_call",
-        extra={
-            "operation": "tool_execution",
-            "tool": "get_metric",
-            "status": "requested",
-            "service": service,
-            "metric": name,
-        },
-    )
     if name is not None and name not in ALLOWED_METRICS:
-        logger.warning(
-            "tool_failed",
-            extra={
-                "operation": "tool_execution",
-                "tool": "get_metric",
-                "status": "invalid_metric",
-                "metric": name,
-            },
+        log_event(
+            logger,
+            "tool.rejected",
+            level=logging.WARNING,
+            tool="get_metric",
+            status="invalid_metric",
+            metric=name[:120],
         )
         return []
     statement = select(ServiceMetric).order_by(ServiceMetric.service, ServiceMetric.name).limit(100)
@@ -116,7 +103,17 @@ def get_metric(
         statement = statement.where(ServiceMetric.service == service)
     if name:
         statement = statement.where(ServiceMetric.name == name)
-    return [MetricResponse.model_validate(row) for row in db.scalars(statement).all()]
+    metrics = [MetricResponse.model_validate(row) for row in db.scalars(statement).all()]
+    log_event(
+        logger,
+        "tool.completed",
+        tool="get_metric",
+        status="completed",
+        service=service,
+        metric=name,
+        result_count=len(metrics),
+    )
+    return metrics
 
 
 def tool_catalog() -> list[dict[str, Any]]:

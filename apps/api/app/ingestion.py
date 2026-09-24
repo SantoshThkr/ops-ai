@@ -184,10 +184,15 @@ def embedding_provider(settings: Settings | None = None) -> EmbeddingProvider:
 def enqueue(document_id: UUID, settings: Settings | None = None) -> bool:
     settings = settings or get_settings()
     try:
-        Redis.from_url(settings.redis_url, decode_responses=True).rpush(
-            settings.queue_name, str(document_id)
-        )
+        Redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        ).rpush(settings.queue_name, str(document_id))
         return True
-    except RedisError:
-        logger.warning("Document %s could not be queued", document_id)
+    except (RedisError, OSError):
+        logger.warning(
+            "document.queue_failed", extra={"document_id": str(document_id), "status": "failed"}
+        )
         return False

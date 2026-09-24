@@ -180,31 +180,51 @@ def test_mcp_tool_allowlist_validation_and_rbac() -> None:
         assert denied["error"]["code"] == -32003
 
 
+class _FakePipeline:
+    def __init__(self, redis: "_FakeRedis") -> None:
+        self.redis = redis
+        self.commands: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    def set(self, *args: Any, **kwargs: Any) -> "_FakePipeline":
+        self.commands.append(("set", args, kwargs))
+        return self
+
+    def incr(self, *args: Any) -> "_FakePipeline":
+        self.commands.append(("incr", args, {}))
+        return self
+
+    def execute(self) -> list[Any]:
+        self.redis.executed.append([name for name, _, _ in self.commands])
+        self.redis.set_kwargs.extend(kwargs for name, _, kwargs in self.commands if name == "set")
+        return [True, next(self.redis.values)]
+
+
 class _FakeRedis:
     def __init__(self, values: list[int] | None = None) -> None:
         self.values = iter(values or [])
-        self.expired: list[tuple[str, int]] = []
+        self.executed: list[list[str]] = []
+        self.set_kwargs: list[dict[str, Any]] = []
 
-    def incr(self, _key: str) -> int:
-        return next(self.values)
-
-    def expire(self, key: str, seconds: int) -> None:
-        self.expired.append((key, seconds))
+    def pipeline(self, transaction: bool = True) -> _FakePipeline:
+        assert transaction is True
+        return _FakePipeline(self)
 
 
 def test_rate_limiter_handles_limit_and_dependency_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = _FakeRedis([1, 3])
-    monkeypatch.setattr("app.limits.Redis.from_url", lambda *args, **kwargs: fake)
+    monkeypatch.setattr("app.limits._redis_client", lambda _url: fake)
     assert check_rate_limit("chat", "user", 2) is True
     assert check_rate_limit("chat", "user", 2) is False
-    assert fake.expired
+    # The window TTL is created atomically with the counter, only on first use.
+    assert fake.executed == [["set", "incr"], ["set", "incr"]]
+    assert fake.set_kwargs[0] == {"ex": 60, "nx": True}
 
-    def unavailable(*args: Any, **kwargs: Any) -> None:
+    def unavailable(_url: str) -> None:
         raise RedisError("redis unavailable")
 
-    monkeypatch.setattr("app.limits.Redis.from_url", unavailable)
+    monkeypatch.setattr("app.limits._redis_client", unavailable)
     assert check_rate_limit("chat", "user", 2) is True
 
 
@@ -228,3 +248,47 @@ def test_health_and_readiness_report_dependency_state(monkeypatch: pytest.Monkey
 class _ReadyRedis:
     def ping(self) -> bool:
         return True
+
+
+def _call(db: Session, user: User, name: str, arguments: object) -> dict[str, Any]:
+    return handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+        db,
+        user,
+    )
+
+
+def test_mcp_argument_and_ownership_failures_use_jsonrpc_error_codes() -> None:
+    with _session() as db:
+        _, analyst, _ = _users(db)
+        wrong_types = _call(db, analyst, "get_metric", {"name": ["latency_p95"]})
+        assert wrong_types["error"]["code"] == -32602
+
+        bad_uuid = _call(db, analyst, "get_incident", {"incident_id": "123"})
+        assert bad_uuid["error"]["code"] == -32602
+
+        foreign_conversation = _call(
+            db,
+            analyst,
+            "create_incident",
+            {
+                "title": "t",
+                "summary": "s",
+                "conversation_id": "00000000-0000-0000-0000-000000000001",
+            },
+        )
+        assert foreign_conversation["error"] == {
+            "code": -32003,
+            "message": "Conversation not found",
+        }
+
+        created = _call(db, analyst, "create_incident", {"title": "t", "summary": "s"})
+        assert created["result"]["content"][0]["json"]["approval_required"] is True
+        assert handle_request({"jsonrpc": "1.0", "id": 1}, db, analyst)["error"]["code"] == -32600
+        not_a_method = handle_request({"jsonrpc": "2.0", "id": 2, "method": "x"}, db, analyst)
+        assert not_a_method["error"]["code"] == -32601

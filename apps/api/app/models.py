@@ -54,6 +54,8 @@ class UserRole(StrEnum):
 
 class User(Base):
     __tablename__ = "users"
+    # Matches the constraint created by migration 0002 (Postgres default name).
+    __table_args__ = (UniqueConstraint("email", name="users_email_key"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     email: Mapped[str] = mapped_column(String(320), index=True, nullable=False)
