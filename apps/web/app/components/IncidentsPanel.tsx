@@ -8,6 +8,7 @@ type IncidentsPanelProps = {
   incidents: Incident[];
   loading: boolean;
   role: Role;
+  currentUserId: string;
   actionStatuses: Record<string, ActionStatus>;
   onRefresh: () => void;
   onStatusChange: (actionId: string, status: ActionStatus) => void;
@@ -18,6 +19,7 @@ export function IncidentsPanel({
   incidents,
   loading,
   role,
+  currentUserId,
   actionStatuses,
   onRefresh,
   onStatusChange,
@@ -43,7 +45,7 @@ export function IncidentsPanel({
       </div>
       <p className="mt-1 text-sm text-slate-400">
         {role === 'admin'
-          ? 'Review proposed actions from every analyst. Nothing runs until you approve and execute it.'
+          ? 'Review proposed actions. Nothing runs until an administrator other than the proposer approves it and an administrator executes it.'
           : 'Your incident proposals. An administrator must approve each action before it can run.'}
       </p>
       {loading && incidents.length === 0 ? (
@@ -82,6 +84,7 @@ export function IncidentsPanel({
                         actionId={action.id}
                         status={actionStatuses[action.id] ?? action.status}
                         role={role}
+                        ownProposal={incident.owner_id === currentUserId}
                         onStatusChange={onStatusChange}
                         onError={onError}
                       />

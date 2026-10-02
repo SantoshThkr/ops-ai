@@ -6,9 +6,8 @@ import logging
 import math
 import re
 import time
-from typing import Any
 
-from sqlalchemy import bindparam, literal_column, select
+from sqlalchemy import Float, bindparam, literal_column, select, type_coerce
 from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
@@ -79,15 +78,16 @@ def search_owned_chunks(
             "query_embedding", value=query_vector, type_=Vector(settings.embedding_dimension)
         )
         distance = DocumentChunk.embedding.op("<=>")(query_param)
-        similarity: Any = (literal_column("1.0") - distance).label("similarity")
-        rows = db.execute(
+        # A concrete type keeps the select() row tuple typed (SQLAlchemy 2.1 stubs).
+        similarity = type_coerce(literal_column("1.0") - distance, Float).label("similarity")
+        vector_rows = db.execute(
             select(DocumentChunk, Document.filename, similarity)
             .join(Document, Document.id == DocumentChunk.document_id)
             .where(*owned)
             .order_by(similarity.desc(), DocumentChunk.id.asc())
             .limit(candidate_limit)
         ).all()
-        scored = [(float(score), chunk, filename) for chunk, filename, score in rows]
+        scored = [(float(score), chunk, filename) for chunk, filename, score in vector_rows]
     else:
         # Portable fallback used by SQLite unit tests and the offline evaluator.
         rows = db.execute(

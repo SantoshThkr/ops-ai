@@ -25,7 +25,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.incidents import audit, can_operate, get_incident, propose
-from app.models import User
+from app.models import User, UserRole
 from app.observability import log_event, timed_operation
 from app.schemas import RESTARTABLE_SERVICES, IncidentProposalCreate
 from app.tools import get_metric
@@ -246,9 +246,10 @@ def _stream_incident_proposal(
                 "expires_at": action.expires_at.isoformat(),
             },
         )
+        approver = "another administrator" if user.role == UserRole.ADMIN else "an administrator"
         text = (
             f"I created an incident proposal with a {action.kind} action for the "
-            f"{intent.service} service. Nothing runs until an administrator approves it."
+            f"{intent.service} service. Nothing runs until {approver} approves it."
         )
     else:
         text = "I created an incident proposal with no operational action attached." + note

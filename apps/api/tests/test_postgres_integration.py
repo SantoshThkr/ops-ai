@@ -8,14 +8,26 @@ Skipped unless TEST_DATABASE_URL points at a pgvector-enabled database, for exam
 import os
 import threading
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import Engine, create_engine, func, select, text
+from sqlalchemy import Engine, create_engine, func, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.incidents import approve, execute, propose
-from app.models import Action, ActionStatus, ApprovalDecision, AuditLog, Base, User, UserRole
+from app.models import (
+    Action,
+    ActionStatus,
+    ApprovalDecision,
+    AuditLog,
+    Base,
+    Document,
+    DocumentStatus,
+    User,
+    UserRole,
+)
+from app.processing import claim_document, recover_stale_documents
 from app.retrieval import search_owned_chunks
 from app.schemas import IncidentProposalCreate
 
@@ -158,3 +170,48 @@ def test_pgvector_search_is_owner_scoped_and_thresholded(
         assert 0.35 <= results[0].similarity <= 1.0
         assert search_owned_chunks(db, stranger, "How is the VPN configured?", 5) == []
         assert search_owned_chunks(db, owner, "What is the weather today?", 5) == []
+
+
+def _document(db: Session, owner: User, status: DocumentStatus) -> UUID:
+    document = Document(
+        owner_id=owner.id,
+        filename="notes.txt",
+        content_type="text/plain",
+        file_size=5,
+        checksum="0" * 64,
+        storage_key=f"{owner.id}/{uuid4()}",
+        status=status,
+    )
+    db.add(document)
+    db.commit()
+    return document.id
+
+
+def test_concurrent_claims_have_exactly_one_winner(factory: sessionmaker[Session]) -> None:
+    with factory() as db:
+        document_id = _document(db, _user(db, UserRole.VIEWER), DocumentStatus.UPLOADED)
+    wins: list[bool] = []
+
+    def claim(barrier: threading.Barrier) -> None:
+        with factory() as db:
+            barrier.wait()
+            wins.append(claim_document(db, document_id))
+
+    assert _run_concurrently([claim for _ in range(5)]) == []
+    assert sorted(wins) == [False, False, False, False, True]
+
+
+def test_recovery_compares_timestamps_correctly(factory: sessionmaker[Session]) -> None:
+    with factory() as db:
+        owner = _user(db, UserRole.VIEWER)
+        abandoned = _document(db, owner, DocumentStatus.PROCESSING)
+        in_progress = _document(db, owner, DocumentStatus.PROCESSING)
+        db.execute(
+            update(Document)
+            .where(Document.id == abandoned)
+            .values(updated_at=datetime.now(UTC) - timedelta(hours=1))
+        )
+        db.commit()
+        recover_stale_documents(db, lambda _document_id: True)
+        assert db.get(Document, abandoned).status == DocumentStatus.FAILED
+        assert db.get(Document, in_progress).status == DocumentStatus.PROCESSING

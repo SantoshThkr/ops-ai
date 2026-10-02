@@ -52,7 +52,10 @@ def set_role(db: Session, email: str, role: UserRole) -> str:
 
 def seed_demo_metrics(db: Session) -> int:
     """Insert demo metrics that are missing; existing rows are left untouched."""
-    existing = set(db.execute(select(ServiceMetric.service, ServiceMetric.name)).tuples())
+    existing = {
+        (service, name)
+        for service, name in db.execute(select(ServiceMetric.service, ServiceMetric.name))
+    }
     created = 0
     for service, name, value, unit in DEMO_METRICS:
         if (service, name) in existing:

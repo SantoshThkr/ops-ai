@@ -3,6 +3,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from redis.exceptions import RedisError
 from sqlalchemy import create_engine, update
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -16,8 +17,17 @@ from app.models import Base, Document, DocumentChunk, DocumentStatus, User, User
 
 
 @pytest.fixture(autouse=True)
-def _reset_cached_redis_client() -> Iterator[None]:
+def _redis_unavailable_for_rate_limits(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Rate limits fail open (Redis "unavailable") so a local Redis cannot make tests flaky.
+
+    Tests that exercise limits patch app.limits._redis_client themselves.
+    """
+
+    def unavailable(_url: str) -> None:
+        raise RedisError("rate limiting disabled in tests")
+
     _redis_client.cache_clear()
+    monkeypatch.setattr("app.limits._redis_client", unavailable)
     yield
     _redis_client.cache_clear()
 

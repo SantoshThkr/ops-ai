@@ -158,3 +158,69 @@ def test_pending_action_cannot_be_executed(sessions: sessionmaker[Session]) -> N
         with pytest.raises(ValueError, match="pending"):
             execute(db, action, admin)
         assert action.status == ActionStatus.PENDING
+
+
+def _propose_as(factory: sessionmaker[Session], user_id: UUID) -> UUID:
+    with factory() as db:
+        user = db.get(User, user_id)
+        assert user is not None
+        incident = propose(
+            db,
+            user,
+            IncidentProposalCreate(
+                title="Admin-raised incident",
+                summary="Restart the worker",
+                action_kind="restart_service",
+                action_parameters={"service": "worker"},
+            ),
+        )
+        return incident.actions[0].id
+
+
+def _admin_proposal(factory: sessionmaker[Session]) -> tuple[UUID, UUID, UUID]:
+    """An action proposed by an administrator, plus that admin's and a second admin's ids."""
+    _, admin_id, second_admin_id = _setup(factory)
+    return _propose_as(factory, admin_id), admin_id, second_admin_id
+
+
+def test_proposer_cannot_approve_their_own_action(sessions: sessionmaker[Session]) -> None:
+    action_id, admin_id, _ = _admin_proposal(sessions)
+    with sessions() as db:
+        action = db.get(Action, action_id)
+        admin = db.get(User, admin_id)
+        assert action is not None and admin is not None
+        with pytest.raises(PermissionError, match="own proposal"):
+            approve(db, action, admin, ApprovalDecision.APPROVED, "self")
+        db.refresh(action)
+        assert action.status == ActionStatus.PENDING
+        assert action.approvals == []
+        denial = db.scalars(
+            select(AuditLog).where(
+                AuditLog.event == "permission.denied", AuditLog.resource_id == str(action_id)
+            )
+        ).one()
+        assert denial.details == {"operation": "approve", "reason": "self_approval"}
+
+
+def test_proposer_can_withdraw_and_a_second_admin_can_approve(
+    sessions: sessionmaker[Session],
+) -> None:
+    withdrawn_id, admin_id, second_admin_id = _admin_proposal(sessions)
+    with sessions() as db:
+        action = db.get(Action, withdrawn_id)
+        admin = db.get(User, admin_id)
+        assert action is not None and admin is not None
+        assert approve(db, action, admin, ApprovalDecision.REJECTED, None).decision == (
+            ApprovalDecision.REJECTED
+        )
+        assert action.status == ActionStatus.REJECTED
+
+    approved_id = _propose_as(sessions, admin_id)
+    with sessions() as db:
+        action = db.get(Action, approved_id)
+        proposer = db.get(User, admin_id)
+        reviewer = db.get(User, second_admin_id)
+        assert action is not None and proposer is not None and reviewer is not None
+        approve(db, action, reviewer, ApprovalDecision.APPROVED, None)
+        # Execution is not restricted: the proposer may run what someone else approved.
+        assert execute(db, action, proposer).status == ActionStatus.EXECUTED

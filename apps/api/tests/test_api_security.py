@@ -146,3 +146,108 @@ def test_json_logs_carry_request_id_and_redact_sensitive_fields() -> None:
     assert payload["user_id"] == "user-1"
     assert payload["password"] == "[redacted]"
     assert payload["authorization"] == "[redacted]"
+
+
+def test_administrators_cannot_approve_their_own_proposals(client_for: ClientFactory) -> None:
+    proposer = client_for("proposer@example.com", UserRole.ADMIN)
+    reviewer = client_for("reviewer@example.com", UserRole.ADMIN)
+    action_id = proposer.post("/incidents", json=PROPOSAL).json()["actions"][0]["id"]
+
+    self_approval = proposer.post(f"/actions/{action_id}/approve", json={"decision": "approved"})
+    assert self_approval.status_code == 403
+    assert "own proposal" in self_approval.json()["detail"]
+    assert (
+        reviewer.post(f"/actions/{action_id}/approve", json={"decision": "approved"}).status_code
+        == 200
+    )
+    assert proposer.post(f"/actions/{action_id}/execute").json()["status"] == "executed"
+
+
+class _CountingPipeline:
+    def __init__(self, redis: "_CountingRedis") -> None:
+        self.redis = redis
+        self.operations: list[tuple[str, str]] = []
+
+    def set(self, key: str, *args: object, **kwargs: object) -> "_CountingPipeline":
+        self.operations.append(("set", key))
+        return self
+
+    def incr(self, key: str) -> "_CountingPipeline":
+        self.operations.append(("incr", key))
+        return self
+
+    def execute(self) -> list[object]:
+        results: list[object] = []
+        for operation, key in self.operations:
+            if operation == "set":
+                results.append(key not in self.redis.counts)
+                self.redis.counts.setdefault(key, 0)
+            else:
+                self.redis.counts[key] += 1
+                results.append(self.redis.counts[key])
+        return results
+
+
+class _CountingRedis:
+    """Enough of Redis for fixed-window counters: SET NX + INCR in a pipeline."""
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+
+    def pipeline(self, transaction: bool = True) -> _CountingPipeline:
+        return _CountingPipeline(self)
+
+
+def _register(client: TestClient, index: int) -> int:
+    return client.post(
+        "/auth/register",
+        json={"email": f"user{index}@example.com", "password": "correct horse", "name": "U"},
+    ).status_code
+
+
+@pytest.mark.usefixtures("session_factory")
+def test_registration_is_throttled_per_client_without_storing_raw_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _CountingRedis()
+    monkeypatch.setattr("app.limits._redis_client", lambda _url: redis)
+    with TestClient(app) as client:
+        assert [_register(client, index) for index in range(10)] == [201] * 10
+        assert _register(client, 10) == 429
+    keys = [key for key in redis.counts if key.startswith("opsai:rate:register-ip:")]
+    assert len(keys) == 1
+    assert "testclient" not in keys[0]
+
+
+@pytest.mark.usefixtures("session_factory")
+def test_login_is_throttled_per_client_across_accounts_and_per_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _CountingRedis()
+    monkeypatch.setattr("app.limits._redis_client", lambda _url: redis)
+
+    def login(client: TestClient, email: str) -> int:
+        return client.post(
+            "/auth/login", json={"email": email, "password": "wrong password"}
+        ).status_code
+
+    with TestClient(app) as client:
+        # Spraying one password across many accounts hits the per-client limit.
+        sprayed = [login(client, f"target{index}@example.com") for index in range(31)]
+        assert sprayed[:30] == [401] * 30
+        assert sprayed[30] == 429
+
+    redis.counts.clear()
+    with TestClient(app) as client:
+        # Guessing one account's password still hits the existing per-account limit.
+        guessed = [login(client, "victim@example.com") for _ in range(11)]
+        assert guessed[:10] == [401] * 10
+        assert guessed[10] == 429
+
+
+def test_api_responses_carry_baseline_security_headers() -> None:
+    with TestClient(app) as client:
+        response = client.get("/version")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["referrer-policy"] == "no-referrer"

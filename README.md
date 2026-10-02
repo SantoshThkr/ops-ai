@@ -45,11 +45,14 @@ only hides controls a user cannot use. Roles:
 | Upload and search own documents, chat, read metrics | ✓ | ✓ | ✓ |
 | Propose incidents (API, chat, MCP) | | ✓ | ✓ |
 | Read incidents and actions | | own | all |
-| Approve, reject, execute actions | | | ✓ |
+| Approve actions | | | ✓, not their own proposals |
+| Reject and execute actions | | | ✓ |
 | Read audit log | | own events | all |
 
 Mutations follow **proposal → approval → execution**. An action needs an unexpired
-administrator approval before it can run. Approval and execution lock the action row
+approval from an administrator **other than the proposer** before it can run, so an
+administrator's own proposals need a second administrator (they can still reject, i.e.
+withdraw, them). Approval and execution lock the action row
 and re-read it, so concurrent requests cannot approve and reject the same action or
 execute it twice (covered by Postgres integration tests). Rejected and expired actions
 never execute. Permission failures return 403, missing or foreign resources 404, and
@@ -60,10 +63,27 @@ role is read from the database on every request, never trusted from the token. W
 `APP_ENV=production` the API refuses to start if `JWT_SECRET` is a placeholder or
 shorter than 32 characters, or if `AUTH_COOKIE_SECURE` is false.
 
+Redis-backed fixed-window limits cap logins per account (10/min) and per client address
+(30/min), and registrations per client address (10/hour). Client addresses are stored
+in Redis only as keyed hashes with a TTL. Behind a reverse proxy, set
+`FORWARDED_ALLOW_IPS` to the proxy's address so uvicorn uses `X-Forwarded-For`;
+otherwise every client shares the proxy's limit. All limits fail open when Redis is
+unavailable, which `/ready` reports.
+
+The web app sends a Content-Security-Policy, `X-Frame-Options: DENY`, `nosniff`,
+`Referrer-Policy`, and `Permissions-Policy`; API responses send `nosniff`,
+`X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`. The CSP forbids framing
+(clickjacking of approval buttons), plugins, `<base>` injection, foreign form targets,
+and network requests to anything but the app and the API. `script-src` still allows
+inline scripts because Next.js hydration needs them without per-request nonces. HSTS is
+left to the TLS-terminating proxy.
+
 `POST /mcp` is an authenticated **MCP-style JSON-RPC adapter**. It supports
 `tools/list` and `tools/call` over the same services and RBAC as the API. It is not a
 full Model Context Protocol server: there is no `initialize` handshake, capability
-negotiation, batching, or notifications.
+negotiation, Streamable HTTP transport, batching, or notifications. Malformed JSON is
+rejected with HTTP 422 rather than a JSON-RPC `-32700` error, and tool results use a
+non-standard `{"type": "json"}` content item.
 
 ## Agent routing
 
@@ -197,9 +217,12 @@ Compose validation against `.env.example`. CI needs no paid AI service or API ke
   in `.env`, and keep `NEXT_PUBLIC_API_URL` and `CORS_ORIGINS` consistent.
 - **The browser calls the wrong API URL**: `NEXT_PUBLIC_API_URL` is baked in at build
   time; rebuild with `up --build`.
-- **Document stuck in `processing`**: the queue is at-most-once; if the worker stopped
-  mid-job, upload the document again. If Redis was unavailable at upload time, the
-  document is marked `failed` with a message asking you to re-upload.
+- **Document failed with “Processing did not finish”**: the worker stopped mid-job;
+  within about 15 minutes it marks such documents failed instead of leaving them in
+  `processing`. Upload the document again. If Redis was unavailable at upload time, the
+  document is marked `failed` immediately with a re-upload message.
+- **429 “Too many registration attempts”**: registrations are limited to 10 per client
+  address per hour. Behind a proxy, check `FORWARDED_ALLOW_IPS`.
 - **Signed out after about 30 minutes**: tokens expire after `JWT_EXPIRE_MINUTES`; there
   is no refresh token.
 - **The API refuses to start**: with `APP_ENV=production`, the log line names the
@@ -210,7 +233,8 @@ Compose validation against `.env.example`. CI needs no paid AI service or API ke
 - Deterministic local providers keep development, tests, and CI reproducible.
 - Retrieval is owner-scoped and thresholded before any citation is emitted.
 - Typed allowlists prevent arbitrary tool, action, target, or SQL selection.
-- Mutations are proposals first; execution requires an unexpired administrator approval.
+- Mutations are proposals first; execution requires an unexpired approval by a second
+  person (separation of duties).
 - Row locks plus a fresh re-read make approval and execution safe under concurrency.
 - The API, agent, and MCP adapter share one service layer, so RBAC is enforced once.
 - The evaluator checks behavior contracts instead of inventing model-quality scores.
@@ -231,14 +255,19 @@ Compose validation against `.env.example`. CI needs no paid AI service or API ke
   `CHAT_PROVIDER=openai` and `OPENAI_API_KEY` for generated answers (optional, untested
   in CI).
 - **Execution is a persisted boundary.** Approved actions are recorded as executed; no
-  external system is called. There is no separation of duties yet: an administrator can
-  approve their own proposal.
-- **Queue delivery is at-most-once.** A worker crash mid-job leaves that document in
-  `processing`.
+  external system is called.
+- **Lost document jobs are failed, not retried.** Each job atomically claims its
+  document, so duplicate deliveries are no-ops. A job lost to a worker crash is detected
+  after 15 minutes and its document is marked failed (re-upload to retry), so a file that
+  crashes the worker cannot cause a crash loop. Uploads that were never picked up are
+  queued again.
 - **Sessions are stateless JWTs.** Logout clears the cookie but does not revoke a copied
   token before it expires.
-- Deployment concerns such as TLS termination, secret management, backups, scaling, and
-  metrics or tracing backends are out of scope for this repository.
+- **The audit log endpoint returns the latest 200 events** with no pagination or
+  `created_at` index; fine at current scale, but worth adding before the table grows
+  large.
+- Deployment concerns such as TLS termination and HSTS, secret management, backups,
+  scaling, and metrics or tracing backends are out of scope for this repository.
 
 ## Configuration
 

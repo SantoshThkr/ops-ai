@@ -23,6 +23,8 @@ type ActionControlsProps = {
   actionId: string;
   status: ActionStatus;
   role: Role;
+  /** True when the signed-in user proposed this action (they cannot approve it). */
+  ownProposal?: boolean;
   onStatusChange: (actionId: string, status: ActionStatus) => void;
   onError: (error: unknown, fallback: string) => void;
 };
@@ -35,6 +37,7 @@ export function ActionControls({
   actionId,
   status,
   role,
+  ownProposal = false,
   onStatusChange,
   onError,
 }: ActionControlsProps) {
@@ -86,18 +89,22 @@ export function ActionControls({
         className={`rounded-full border px-2 py-0.5 text-xs ${STATUS_STYLE[status]}`}
         role="status"
       >
-        {STATUS_TEXT[status]}
+        {status === 'pending' && ownProposal && role === 'admin'
+          ? 'Awaiting approval from another administrator'
+          : STATUS_TEXT[status]}
       </span>
       {role === 'admin' && status === 'pending' && (
         <>
-          <button
-            type="button"
-            className={`${buttonClass} bg-amber-400`}
-            disabled={busy}
-            onClick={() => void decide('approved')}
-          >
-            Approve
-          </button>
+          {!ownProposal && (
+            <button
+              type="button"
+              className={`${buttonClass} bg-amber-400`}
+              disabled={busy}
+              onClick={() => void decide('approved')}
+            >
+              Approve
+            </button>
+          )}
           <button
             type="button"
             className={`${buttonClass} bg-slate-300`}

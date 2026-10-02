@@ -10,19 +10,21 @@ from redis.exceptions import RedisError
 
 from app.config import Settings, get_settings
 from app.db import SessionLocal
+from app.ingestion import enqueue
 from app.observability import configure_logging, log_event
-from app.processing import process_document
+from app.processing import process_document, recover_stale_documents
 
 logger = logging.getLogger(__name__)
 _REDIS_RETRY_SECONDS = 2.0
+_RECOVERY_INTERVAL_SECONDS = 60.0
 
 
 def run_once(queue: Any, settings: Settings) -> bool:
     """Process at most one queued document. Returns False when Redis could not be read.
 
     Failures are logged and swallowed so one bad job or a transient database error
-    does not stop the worker. Delivery is at-most-once: a job popped just before a
-    crash is not retried automatically.
+    does not stop the worker. A job lost to a crash is not replayed from the queue;
+    recover_once() later marks its document failed (or re-queues it if never claimed).
     """
     try:
         item = cast(tuple[str, str] | None, queue.blpop([settings.queue_name], timeout=5))
@@ -52,12 +54,26 @@ def run_once(queue: Any, settings: Settings) -> bool:
     return True
 
 
+def recover_once(settings: Settings) -> None:
+    """Resolve documents whose job was lost; failures are logged and retried next interval."""
+    try:
+        with SessionLocal() as db:
+            recover_stale_documents(db, lambda document_id: enqueue(document_id, settings))
+    except Exception:
+        logger.exception("worker.recovery_failed", extra={"status": "failed"})
+
+
 def main() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     queue = Redis.from_url(settings.redis_url, decode_responses=True)
     log_event(logger, "worker.started", queue=settings.queue_name)
+    next_recovery = 0.0
     while True:
+        # Runs at startup (picking up jobs lost by a previous crash) and then periodically.
+        if time.monotonic() >= next_recovery:
+            recover_once(settings)
+            next_recovery = time.monotonic() + _RECOVERY_INTERVAL_SECONDS
         if not run_once(queue, settings):
             time.sleep(_REDIS_RETRY_SECONDS)
 

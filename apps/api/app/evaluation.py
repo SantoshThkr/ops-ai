@@ -276,6 +276,13 @@ def _incident_cases(db: Session, analyst: User, admin: User) -> list[EvaluationC
     cases.append(
         EvaluationCase("incident", "rejected_action_not_executable", "refused", rejected_result)
     )
+    own = propose(db, admin, proposal).actions[0]
+    try:
+        approve(db, own, admin, ApprovalDecision.APPROVED, "evaluation-self-approval")
+        self_approval = "approved"
+    except PermissionError:
+        self_approval = "denied"
+    cases.append(EvaluationCase("incident", "self_approval_denied", "denied", self_approval))
     return cases
 
 

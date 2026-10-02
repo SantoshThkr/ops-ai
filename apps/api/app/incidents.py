@@ -212,6 +212,19 @@ def approve(
         audit(db, approver, "permission.denied", "action", action.id, {"operation": "approve"})
         db.commit()
         raise PermissionError("You do not have permission to approve this action")
+    if decision == ApprovalDecision.APPROVED and action.owner_id == approver.id:
+        # Separation of duties: approval needs a second person. Rejecting (withdrawing)
+        # your own proposal stays allowed because it can only prevent execution.
+        audit(
+            db,
+            approver,
+            "permission.denied",
+            "action",
+            action.id,
+            {"operation": "approve", "reason": "self_approval"},
+        )
+        db.commit()
+        raise PermissionError("You cannot approve your own proposal; another administrator must")
     action = _lock_action(db, action)
     existing = db.scalar(
         select(Approval).where(

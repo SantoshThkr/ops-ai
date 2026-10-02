@@ -68,6 +68,9 @@ or `ValueError` (409 for state conflicts); routes translate those into HTTP resp
  rejected                   expired ◀── pending, window elapsed at approval time
 ```
 
+- Separation of duties: the proposer can never approve their own action (403, audited
+  as `self_approval`). They may reject (withdraw) it, and may execute it once a
+  different administrator has approved it.
 - Approval and execution lock the action row (`SELECT … FOR UPDATE`) and reload it, so
   a request that loaded the action earlier cannot act on stale state.
 - An administrator repeating their own decision gets the recorded decision back; any
@@ -89,8 +92,12 @@ README's Limitations section covers the trade-offs.
 - PostgreSQL with pgvector stores all durable state and embeddings.
 - Redis carries document jobs and fixed-window rate-limit counters. Rate limiting fails
   open when Redis is unavailable; `/ready` reports that state.
-- The worker consumes jobs from a Redis list (at-most-once delivery) and survives
-  transient Redis and database errors.
+- The worker consumes jobs from a Redis list and survives transient Redis and database
+  errors. A job processes a document only after atomically claiming it
+  (`uploaded → processing`), so duplicate deliveries are no-ops. Every minute the worker
+  marks documents stuck in `processing` for 15 minutes as failed (a lost job; not
+  retried, so a crashing file cannot loop) and re-queues `uploaded` documents that no job
+  claimed.
 - `/health` checks the API and database; `/ready` checks the database and Redis.
 
 ## Development and delivery

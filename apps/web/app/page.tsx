@@ -652,6 +652,7 @@ export default function HomePage() {
                                     ] ?? 'pending'
                                   }
                                   role={user.role}
+                                  ownProposal
                                   onStatusChange={handleActionStatus}
                                   onError={reportError}
                                 />
@@ -696,6 +697,7 @@ export default function HomePage() {
               incidents={incidents}
               loading={incidentsLoading}
               role={user.role}
+              currentUserId={user.id}
               actionStatuses={actionStatuses}
               onRefresh={() => void loadIncidents()}
               onStatusChange={handleActionStatus}

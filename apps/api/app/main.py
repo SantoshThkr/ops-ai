@@ -1,3 +1,4 @@
+import hmac
 import json
 import logging
 import time
@@ -121,6 +122,14 @@ app.add_middleware(
 )
 
 
+# JSON API responses are never framed, sniffed as HTML, or given a Referer.
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
+
+
 @app.middleware("http")
 async def request_logging(request: Request, call_next: Any) -> Response:
     started = time.monotonic()
@@ -142,6 +151,8 @@ async def request_logging(request: Request, call_next: Any) -> Response:
         raise
     else:
         response.headers["x-request-id"] = request_id
+        for name, value in _SECURITY_HEADERS.items():
+            response.headers.setdefault(name, value)
         # For streamed responses this measures time to first byte, not stream length.
         log_event(
             logger,
@@ -165,6 +176,22 @@ def _set_auth_cookie(response: Response, token: str) -> None:
         samesite="lax",
         max_age=settings.jwt_expire_minutes * 60,
     )
+
+
+def _client_key(request: Request) -> str:
+    """Rate-limit identity for the client address, keyed so Redis never holds raw IPs.
+
+    Behind a reverse proxy, set FORWARDED_ALLOW_IPS so uvicorn trusts its
+    X-Forwarded-For header; otherwise every client shares the proxy's bucket.
+    """
+    host = request.client.host if request.client else "unknown"
+    return hmac.new(settings.jwt_secret.encode(), host.encode(), sha256).hexdigest()[:32]
+
+
+def _deny_rate_limited(db: Session, scope: str, detail: str) -> HTTPException:
+    audit(db, None, "rate_limit.denied", "auth", None, {"scope": scope})
+    db.commit()
+    return HTTPException(status_code=429, detail=detail)
 
 
 def _conversation_title_from_message(message: str) -> str:
@@ -211,9 +238,13 @@ def version() -> dict[str, str]:
 @app.post("/auth/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 def register(
     user_data: UserCreate,
+    request: Request,
     response: Response,
     db: Session = Depends(get_db),  # noqa: B008
 ) -> AuthResponse:
+    # Each registration runs a deliberately slow password hash; cap it per client.
+    if not check_rate_limit("register-ip", _client_key(request), 10, 3600):
+        raise _deny_rate_limited(db, "register", "Too many registration attempts")
     email = str(user_data.email).lower()
     if db.scalar(select(User).where(User.email == email)) is not None:
         audit(db, None, "auth.register_failed", "user", None, {"reason": "duplicate"})
@@ -244,14 +275,16 @@ def register(
 @app.post("/auth/login", response_model=AuthResponse)
 def login(
     credentials: LoginRequest,
+    request: Request,
     response: Response,
     db: Session = Depends(get_db),  # noqa: B008
 ) -> AuthResponse:
     email = str(credentials.email).lower()
+    # Per account (guessing one password) and per client (spraying many accounts).
     if not check_rate_limit("login", email, 10, 60):
-        audit(db, None, "rate_limit.denied", "auth", None, {"scope": "login"})
-        db.commit()
-        raise HTTPException(status_code=429, detail="Too many login attempts")
+        raise _deny_rate_limited(db, "login", "Too many login attempts")
+    if not check_rate_limit("login-ip", _client_key(request), 30, 60):
+        raise _deny_rate_limited(db, "login_ip", "Too many login attempts")
     user = db.scalar(select(User).where(User.email == email))
     password_valid = False
     if user is not None:

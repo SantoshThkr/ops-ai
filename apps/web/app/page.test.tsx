@@ -48,6 +48,31 @@ async function send(text: string) {
   fireEvent.click(screen.getByRole('button', { name: 'Send' }));
 }
 
+function analystIncident(
+  status: 'pending' | 'approved' | 'rejected' | 'executed',
+) {
+  return {
+    id: 'incident-id',
+    owner_id: 'analyst-id',
+    title: 'API error rate is elevated',
+    summary: 'Restart the api',
+    severity: 'high',
+    status: 'proposed',
+    created_at: '2026-08-28T00:00:00Z',
+    actions: [
+      {
+        id: 'action-id',
+        incident_id: 'incident-id',
+        kind: 'restart_service',
+        parameters: { service: 'api' },
+        status,
+        expires_at: '2026-08-28T01:00:00Z',
+        executed_at: null,
+      },
+    ],
+  };
+}
+
 const approvalStream = sse(
   ['tool_call', { name: 'create_incident' }],
   [
@@ -410,47 +435,72 @@ describe('HomePage', () => {
     );
   });
 
-  it('lets an administrator approve and then execute a proposed action', async () => {
-    const calls = signedIn(admin, {
+  it('does not let an administrator approve their own proposal', async () => {
+    signedIn(admin, {
       'POST /conversations/conversation-id/messages': {
         stream: approvalStream,
       },
-      'POST /actions/action-id/approve': { body: { decision: 'approved' } },
-      'POST /actions/action-id/execute': { body: { status: 'executed' } },
     });
 
     render(<HomePage />);
     await send('Create an incident and restart the api service');
 
     expect(
-      await screen.findByText(/Restart the api service/),
+      await screen.findByText('Awaiting approval from another administrator'),
     ).toBeInTheDocument();
+    const card = screen.getByText(/Proposed action:/).parentElement!;
     expect(
-      screen.getByText('Awaiting administrator approval'),
+      within(card).queryByRole('button', { name: 'Approve' }),
+    ).not.toBeInTheDocument();
+    // Withdrawing your own proposal is still allowed.
+    expect(
+      within(card).getByRole('button', { name: 'Reject' }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  });
+
+  it("lets an administrator approve and execute another user's proposal", async () => {
+    const calls = signedIn(admin, {
+      'GET /incidents': [
+        { body: [analystIncident('pending')] },
+        { body: [analystIncident('approved')] },
+        { body: [analystIncident('executed')] },
+      ],
+      'POST /actions/action-id/approve': { body: { decision: 'approved' } },
+      'POST /actions/action-id/execute': { body: { status: 'executed' } },
+    });
+
+    render(<HomePage />);
+    const panel = await screen.findByRole('region', {
+      name: 'Incidents and approvals',
+    });
+    expect(
+      await within(panel).findByText('Awaiting administrator approval'),
+    ).toBeInTheDocument();
+    fireEvent.click(within(panel).getByRole('button', { name: 'Approve' }));
 
     expect(
-      await screen.findByText('Approved — ready to execute'),
+      await within(panel).findByText('Approved — ready to execute'),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Execute' }));
+    fireEvent.click(within(panel).getByRole('button', { name: 'Execute' }));
 
-    expect(await screen.findByText('Executed')).toBeInTheDocument();
+    expect(await within(panel).findByText('Executed')).toBeInTheDocument();
     expect(
-      screen.queryByRole('button', { name: 'Approve' }),
+      within(panel).queryByRole('button', { name: 'Approve' }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole('button', { name: 'Execute' }),
+      within(panel).queryByRole('button', { name: 'Execute' }),
     ).not.toBeInTheDocument();
-    expect(screen.queryByText(/Approval required/)).not.toBeInTheDocument();
     expect(calls).toContain('POST /actions/action-id/approve');
+    expect(calls).toContain('POST /actions/action-id/execute');
   });
 
   it('shows approval failures and resynchronizes the action state', async () => {
     signedIn(admin, {
-      'POST /conversations/conversation-id/messages': {
-        stream: approvalStream,
-      },
+      // Another administrator rejected it before this click reached the server.
+      'GET /incidents': [
+        { body: [analystIncident('pending')] },
+        { body: [analystIncident('rejected')] },
+      ],
       'POST /actions/action-id/approve': {
         status: 409,
         body: { detail: 'Action has already reached a terminal status' },
@@ -459,17 +509,21 @@ describe('HomePage', () => {
     });
 
     render(<HomePage />);
-    await send('Create an incident and restart the api service');
-    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    const panel = await screen.findByRole('region', {
+      name: 'Incidents and approvals',
+    });
+    fireEvent.click(
+      await within(panel).findByRole('button', { name: 'Approve' }),
+    );
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Action has already reached a terminal status',
     );
     expect(
-      await screen.findByText('Rejected — this action will not run'),
+      await within(panel).findByText('Rejected — this action will not run'),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole('button', { name: 'Approve' }),
+      within(panel).queryByRole('button', { name: 'Approve' }),
     ).not.toBeInTheDocument();
   });
 
