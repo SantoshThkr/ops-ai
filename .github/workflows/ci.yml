@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
       - name: Install frontend dependencies
         run: npm ci
@@ -96,6 +96,31 @@ jobs:
         run: npm run build:web
       - name: TypeScript
         run: npm run typecheck:web
+
+  security:
+    # Fails when a secret is committed or a runtime dependency has a known vulnerability.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret scan (full history)
+        run: docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:latest git /repo --no-banner --redact
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: apps/api/pyproject.toml
+      - name: Python dependency audit
+        working-directory: apps/api
+        # Editable install so pip-audit skips this project and audits only its dependencies.
+        run: python -m pip install --upgrade pip setuptools && python -m pip install -e . pip-audit && pip-audit --skip-editable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: JavaScript runtime dependency audit
+        run: npm audit --omit=dev --audit-level=high
 
   compose:
     runs-on: ubuntu-latest

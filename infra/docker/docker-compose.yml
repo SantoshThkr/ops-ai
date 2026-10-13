@@ -1,3 +1,15 @@
+# Shared hardening for the application containers: no Linux capabilities, no privilege
+# escalation, an immutable root filesystem, and bounded processes. Writable paths are
+# limited to the document volume and an in-memory /tmp.
+x-app-hardening: &app-hardening
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  restart: unless-stopped
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -80,7 +92,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
+    <<: *app-hardening
+    # Uploads larger than 1 MB are spooled to /tmp before validation.
+    tmpfs:
+      - /tmp:size=128m
+    mem_limit: 1g
 
   worker:
     build:
@@ -101,6 +117,7 @@ services:
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       CHUNK_SIZE: ${CHUNK_SIZE:-1000}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-100}
+      DOCUMENT_PROCESSING_TIME_LIMIT_SECONDS: ${DOCUMENT_PROCESSING_TIME_LIMIT_SECONDS:-120}
       QUEUE_NAME: ${QUEUE_NAME:-opsai:document-processing}
     volumes:
       - document_storage:/data/documents
@@ -111,7 +128,12 @@ services:
         condition: service_healthy
       api:
         condition: service_healthy
-    restart: unless-stopped
+    <<: *app-hardening
+    tmpfs:
+      - /tmp:size=64m
+    # Caps the damage of a file crafted to exhaust the parser's memory; the container
+    # restarts and the stale-job sweep marks that document failed.
+    mem_limit: 1g
 
   web:
     build:
@@ -136,7 +158,11 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    restart: unless-stopped
+    <<: *app-hardening
+    tmpfs:
+      - /tmp:size=64m
+      - /app/apps/web/.next/cache:size=64m,uid=1000,gid=1000
+    mem_limit: 512m
 
 volumes:
   postgres_data:

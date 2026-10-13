@@ -101,7 +101,15 @@ def test_production_refuses_placeholder_secrets_and_insecure_cookies() -> None:
     development = Settings(_env_file=None)
     assert "JWT_SECRET is still a placeholder value" in insecure_settings(development)
 
-    short = Settings(_env_file=None, jwt_secret="too-short", auth_cookie_secure=True)
+    assert any("DATABASE_URL" in problem for problem in insecure_settings(development))
+
+    database_url = "postgresql+psycopg://opsai:a-unique-production-password@db:5432/opsai"
+    short = Settings(
+        _env_file=None,
+        jwt_secret="too-short",
+        auth_cookie_secure=True,
+        database_url=database_url,
+    )
     assert insecure_settings(short) == ["JWT_SECRET must be at least 32 characters"]
 
     hardened = Settings(
@@ -109,6 +117,7 @@ def test_production_refuses_placeholder_secrets_and_insecure_cookies() -> None:
         jwt_secret="x" * 48,
         auth_cookie_secure=True,
         cors_origins="https://ops.example.com",
+        database_url=database_url,
     )
     assert insecure_settings(hardened) == []
 
@@ -251,3 +260,34 @@ def test_api_responses_carry_baseline_security_headers() -> None:
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["referrer-policy"] == "no-referrer"
+
+
+@pytest.mark.parametrize(
+    ("role", "path", "body", "limit"),
+    [
+        (UserRole.VIEWER, "/conversations", {}, 30),
+        (UserRole.VIEWER, "/documents/search", {"query": "vpn"}, 60),
+        (UserRole.VIEWER, "/metrics/query", {}, 120),
+        (UserRole.VIEWER, "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, 60),
+        (UserRole.ANALYST, "/incidents", PROPOSAL, 30),
+        (UserRole.ADMIN, "/actions/00000000-0000-0000-0000-000000000001/execute", None, 30),
+    ],
+)
+def test_authenticated_write_and_compute_endpoints_are_rate_limited_per_user(
+    client_for: ClientFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    role: UserRole,
+    path: str,
+    body: dict[str, object] | None,
+    limit: int,
+) -> None:
+    client = client_for("busy@example.com", role)
+    other = client_for("quiet@example.com", role)
+    redis = _CountingRedis()
+    monkeypatch.setattr("app.limits._redis_client", lambda _url: redis)
+
+    statuses = [client.post(path, json=body).status_code for _ in range(limit + 1)]
+    assert 429 not in statuses[:limit]
+    assert statuses[limit] == 429
+    # Limits are per user: someone else is unaffected.
+    assert other.post(path, json=body).status_code != 429

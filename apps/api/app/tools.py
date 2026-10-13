@@ -32,7 +32,6 @@ TOOL_DEFINITIONS = (
     ToolDefinition("get_incident", "Read an authorized incident.", True),
     ToolDefinition("create_incident", "Create an incident proposal; approval is required.", False),
 )
-TOOLS = {definition.name: definition for definition in TOOL_DEFINITIONS}
 
 # Metrics are data contracts, not values invented by the assistant.
 ALLOWED_METRICS = frozenset(
@@ -125,7 +124,3 @@ def tool_catalog() -> list[dict[str, Any]]:
         }
         for definition in TOOL_DEFINITIONS
     ]
-
-
-# Kept as a typed alias for integrations that used the Day 5 name.
-read_metrics = get_metric

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import signal
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
@@ -36,6 +39,38 @@ class UnreadableDocumentError(ValueError):
     """The file was valid but contained no extractable text (for example, a scanned PDF)."""
 
 
+class ProcessingTimeoutError(Exception):
+    """Extraction exceeded its time budget (for example, a PDF crafted to hang the parser)."""
+
+
+@contextmanager
+def time_limit(seconds: float) -> Iterator[None]:
+    """Abort the wrapped block after `seconds`.
+
+    Document parsers handle untrusted files and have a history of infinite-loop bugs, so
+    one file must not be able to stall the worker. Uses SIGALRM, which only works in the
+    main thread on POSIX (where the worker runs); elsewhere the block runs unbounded.
+    """
+    if (
+        seconds <= 0
+        or not hasattr(signal, "setitimer")
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        yield
+        return
+
+    def expired(_signum: int, _frame: object) -> None:
+        raise ProcessingTimeoutError("Document took too long to process")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def process_document(
     db: Session,
     document_id: UUID,
@@ -64,11 +99,14 @@ def process_document(
         file_storage = file_storage or storage(settings)
         embeddings = embeddings or embedding_provider(settings)
         suffix = "." + document.filename.rsplit(".", 1)[-1].lower()
-        pages = extract_text(file_storage.read(document.storage_key), suffix)
-        chunks = chunk_text(pages, settings.chunk_size, settings.chunk_overlap)
-        if not chunks:
-            raise UnreadableDocumentError("No readable text found in the document")
-        vectors = embeddings.embed([item[0] for item in chunks])
+        data = file_storage.read(document.storage_key)
+        # Only parsing and embedding are time-boxed; database work stays outside the alarm.
+        with time_limit(settings.document_processing_time_limit_seconds):
+            pages = extract_text(data, suffix)
+            chunks = chunk_text(pages, settings.chunk_size, settings.chunk_overlap)
+            if not chunks:
+                raise UnreadableDocumentError("No readable text found in the document")
+            vectors = embeddings.embed([item[0] for item in chunks])
         if len(vectors) != len(chunks):
             raise ValueError("Embedding provider returned an invalid result")
         db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document.id))
@@ -103,7 +141,7 @@ def process_document(
             # Only our own validation messages are shown to users; parser errors stay in logs.
             document.error_message = (
                 str(error)
-                if isinstance(error, UnreadableDocumentError)
+                if isinstance(error, UnreadableDocumentError | ProcessingTimeoutError)
                 else "Document processing failed"
             )
             db.commit()

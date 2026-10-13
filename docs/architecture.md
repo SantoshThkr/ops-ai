@@ -87,6 +87,15 @@ With the default local hash embedding, a chunk must also share at least one cont
 word with the question, because function words alone can clear the threshold. The
 README's Limitations section covers the trade-offs.
 
+## Request guards
+
+Before routing, the HTTP middleware rejects state-changing requests whose `Origin` is
+neither a configured web origin nor the API itself (403), bodies whose declared length
+exceeds the per-route limit (413), and chunked bodies with no declared length (411).
+Every response then gets a request ID and the baseline security headers. Authentication
+and role checks are FastAPI dependencies on each route; a test enumerates all routes and
+fails if any new one answers anonymously without being added to an explicit allowlist.
+
 ## Runtime dependencies
 
 - PostgreSQL with pgvector stores all durable state and embeddings.

@@ -90,10 +90,6 @@ def validate_upload(upload: UploadFile, data: bytes, settings: Settings | None =
     return suffix
 
 
-def checksum(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def extract_text(data: bytes, suffix: str) -> list[tuple[str, int | None]]:
     if suffix == ".pdf":
         pages: list[tuple[str, int | None]] = []

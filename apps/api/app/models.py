@@ -86,11 +86,6 @@ class User(Base):
     )
 
 
-class ConversationRole(StrEnum):
-    USER = "user"
-    ASSISTANT = "assistant"
-
-
 class Conversation(Base):
     __tablename__ = "conversations"
 

@@ -355,15 +355,3 @@ def stream(
         yield from _stream_incident_lookup(intent, db, user)
     elif intent.kind == IntentKind.ACTION_REQUEST:
         yield from _stream_action_request(user)
-
-
-class LocalDeterministicAgent:
-    def stream(
-        self,
-        question: str,
-        db: Session,
-        user: User,
-        *,
-        conversation_id: Any = None,
-    ) -> Iterator[tuple[str, dict[str, Any]]]:
-        yield from stream(question, db, user, conversation_id=conversation_id)

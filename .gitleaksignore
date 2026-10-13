@@ -1,0 +1,5 @@
+# Known finding in git history: .env.example once contained a real JWT_SECRET (and a
+# database password). The values are treated as public: they are not used anywhere, and
+# the API refuses to start in production with either of them (see app/config.py).
+# Rotate any environment that ever copied them. New findings must not be added here.
+5cd6810dbb1a8e81ecddd8d8604e54df8cf76659:.env.example:generic-api-key:11

@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -24,6 +25,23 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, hashed_password: str) -> bool:
     return password_hash.verify(password, hashed_password)
+
+
+@lru_cache(maxsize=1)
+def _decoy_hash() -> str:
+    return password_hash.hash("decoy-password-for-unknown-accounts")
+
+
+def verify_password_for(user: User | None, password: str) -> bool:
+    """Check a login password, spending the same hashing time when the account is unknown.
+
+    Without the decoy, a missing account answers measurably faster than a wrong password,
+    which lets an attacker enumerate registered emails.
+    """
+    if user is None:
+        password_hash.verify(password, _decoy_hash())
+        return False
+    return verify_password(password, user.password_hash)
 
 
 def create_access_token(user: User) -> str:
@@ -58,7 +76,12 @@ def get_current_user(
     if not token:
         raise _unauthorized()
     try:
-        payload: dict[str, Any] = jwt.decode(token, get_settings().jwt_secret, algorithms=["HS256"])
+        payload: dict[str, Any] = jwt.decode(
+            token,
+            get_settings().jwt_secret,
+            algorithms=["HS256"],
+            options={"require": ["exp", "sub"]},
+        )
         if payload.get("type") != "access":
             raise _unauthorized()
         user_id = UUID(str(payload["sub"]))

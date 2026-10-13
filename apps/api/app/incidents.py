@@ -348,10 +348,3 @@ def execute(db: Session, action: Action, actor: User) -> Action:
         duration_ms=elapsed_ms(started),
     )
     return action
-
-
-class IncidentService:
-    propose = staticmethod(propose)
-    approve = staticmethod(approve)
-    execute = staticmethod(execute)
-    get_incident = staticmethod(get_incident)

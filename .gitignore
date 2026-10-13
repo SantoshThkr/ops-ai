@@ -12,3 +12,5 @@ node_modules/
 *.tsbuildinfo
 dist/
 coverage/
+# Uploaded documents when the API runs on the host (STORAGE_DIR=./storage)
+storage/

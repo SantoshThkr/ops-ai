@@ -58,14 +58,32 @@ execute it twice (covered by Postgres integration tests). Rejected and expired a
 never execute. Permission failures return 403, missing or foreign resources 404, and
 state conflicts 409.
 
-Authentication uses HTTP-only, `SameSite=Lax` cookies carrying a short-lived JWT; the
-role is read from the database on every request, never trusted from the token. With
-`APP_ENV=production` the API refuses to start if `JWT_SECRET` is a placeholder or
-shorter than 32 characters, or if `AUTH_COOKIE_SECURE` is false.
+Authentication uses HTTP-only, `SameSite=Lax` cookies carrying a short-lived JWT
+(HS256, expiry required); the role is read from the database on every request, never
+trusted from the token. Passwords are hashed with Argon2, and a login for an unknown
+account costs the same hashing time as a wrong password.
+
+With `APP_ENV=production` the API refuses to start if `JWT_SECRET` is a placeholder,
+shorter than 32 characters, or a value that was once published in this repository's
+history; if the database password is a placeholder or published value; or if
+`AUTH_COOKIE_SECURE` is false. Production also disables `/docs`, `/redoc`, and
+`/openapi.json` and sends `Strict-Transport-Security`.
+
+State-changing requests that carry an `Origin` header are accepted only from
+`CORS_ORIGINS` (or the API's own origin). `SameSite=Lax` stops other sites, but not
+other origins on the same site, such as another port on `localhost` or a sibling
+subdomain, and body-less or multipart endpoints need no CORS preflight. Clients that
+send no `Origin` (curl, scripts, MCP clients) are unaffected. Request bodies are capped
+by declared length before any handler runs: 256 KiB for JSON and `MAX_FILE_SIZE` plus
+multipart overhead for uploads; chunked bodies without a length are refused (411).
+Validation errors report the field and reason but never echo the submitted value.
 
 Redis-backed fixed-window limits cap logins per account (10/min) and per client address
-(30/min), and registrations per client address (10/hour). Client addresses are stored
-in Redis only as keyed hashes with a TTL. Behind a reverse proxy, set
+(30/min), and registrations per client address (10/hour). Every other state-changing or
+compute-heavy endpoint is limited per user: chat, conversation creation, incident
+proposals, approvals, and executions at 30/min; uploads at 20/min; search and MCP calls
+at 60/min; metric queries at 120/min. Client addresses are stored in Redis only as keyed
+hashes with a TTL. Behind a reverse proxy, set
 `FORWARDED_ALLOW_IPS` to the proxy's address so uvicorn uses `X-Forwarded-For`;
 otherwise every client shares the proxy's limit. All limits fail open when Redis is
 unavailable, which `/ready` reports.
@@ -75,8 +93,17 @@ The web app sends a Content-Security-Policy, `X-Frame-Options: DENY`, `nosniff`,
 `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`. The CSP forbids framing
 (clickjacking of approval buttons), plugins, `<base>` injection, foreign form targets,
 and network requests to anything but the app and the API. `script-src` still allows
-inline scripts because Next.js hydration needs them without per-request nonces. HSTS is
-left to the TLS-terminating proxy.
+inline scripts because Next.js hydration needs them without per-request nonces.
+Production builds of the web app also send `Strict-Transport-Security` (browsers ignore
+it over plain HTTP), and the unused image-optimization endpoint is disabled.
+
+Uploaded files are treated as hostile: extension, declared type, and content are
+checked; stored under generated keys and never served back; and parsed by the worker
+under a time limit (`DOCUMENT_PROCESSING_TIME_LIMIT_SECONDS`) and a container memory
+limit, so a file crafted to hang or bloat the PDF parser fails that one document.
+
+The application containers run as non-root with a read-only root filesystem, no Linux
+capabilities, `no-new-privileges`, and memory and process limits.
 
 `POST /mcp` is an authenticated **MCP-style JSON-RPC adapter**. It supports
 `tools/list` and `tools/call` over the same services and RBAC as the API. It is not a
@@ -205,11 +232,21 @@ npm ci
 npm run test:web && npm run lint:web && npm run typecheck:web && npm run build:web
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs four jobs on every push and pull
+GitHub Actions (`.github/workflows/ci.yml`) runs five jobs on every push and pull
 request: backend checks, tests, and the evaluator; a Postgres job that applies
 migrations, runs `alembic check` for model drift, tests a full downgrade and re-upgrade,
-and runs the Postgres integration tests; the frontend checks and production build; and
-Compose validation against `.env.example`. CI needs no paid AI service or API key.
+and runs the Postgres integration tests; the frontend checks and production build; a
+security job (gitleaks over the full history, `pip-audit`, and `npm audit` on runtime
+dependencies); and Compose validation against `.env.example`. CI needs no paid AI
+service or API key. Dependabot opens weekly update pull requests.
+
+The same scans run locally:
+
+```bash
+docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:latest git /repo --redact
+cd apps/api && pip install -e . pip-audit && pip-audit --skip-editable
+npm audit --omit=dev --audit-level=high
+```
 
 ## Troubleshooting
 
@@ -227,6 +264,10 @@ Compose validation against `.env.example`. CI needs no paid AI service or API ke
   is no refresh token.
 - **The API refuses to start**: with `APP_ENV=production`, the log line names the
   unsafe setting.
+- **403 “Cross-origin request blocked”**: the page calling the API is not listed in
+  `CORS_ORIGINS`. Add the web app's exact origin (scheme, host, and port).
+- **411 or 413 on a request**: bodies need a `Content-Length` and must fit the limits
+  above. A proxy that streams uploads with chunked encoding must buffer them instead.
 
 ## Key engineering decisions
 
@@ -266,8 +307,21 @@ Compose validation against `.env.example`. CI needs no paid AI service or API ke
 - **The audit log endpoint returns the latest 200 events** with no pagination or
   `created_at` index; fine at current scale, but worth adding before the table grows
   large.
-- Deployment concerns such as TLS termination and HSTS, secret management, backups,
-  scaling, and metrics or tracing backends are out of scope for this repository.
+- **No per-user storage quota or document deletion.** Uploads are rate-limited
+  (20/min) and size-limited, but a user can keep adding documents.
+- **The API connects to PostgreSQL as the database owner** and runs migrations with the
+  same role. A deployment should use a separate, least-privilege runtime role.
+- **Some build-time tooling has open advisories.** `npm audit` reports denial-of-service
+  issues in the glob and selector parsers used by Tailwind CSS 3 and the ESLint config.
+  They process this repository's own files at build time and are not in the production
+  image (`npm audit --omit=dev` is clean); clearing them means migrating to Tailwind 4
+  and ESLint 9.
+- **Credentials were once committed.** An early `.env.example` contained a real JWT
+  secret and database password. They remain in git history, are treated as public, and
+  are rejected in production; any environment that ever used them must rotate them.
+- Deployment concerns such as TLS termination, secret management, encryption at rest for
+  the database and document volume, backups, scaling, and metrics or tracing backends
+  are out of scope for this repository.
 
 ## Configuration
 

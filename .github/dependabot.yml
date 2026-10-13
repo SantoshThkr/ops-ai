@@ -1,0 +1,28 @@
+# Weekly dependency update pull requests. The CI "security" job fails on known
+# vulnerabilities in runtime dependencies; these PRs are how they get fixed.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /apps/api
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python:
+        patterns: ['*']
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      javascript:
+        patterns: ['*']
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: docker
+    directory: /infra/docker
+    schedule:
+      interval: monthly

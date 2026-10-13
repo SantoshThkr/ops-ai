@@ -1,19 +1,22 @@
+import time
 from contextlib import nullcontext
 from io import BytesIO
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import UploadFile
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from redis.exceptions import ConnectionError as RedisConnectionError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from starlette.datastructures import Headers
 
 from app.config import Settings
-from app.ingestion import LocalFileStorage, chunk_text, validate_upload
-from app.models import Base, Document, DocumentStatus, User, UserRole
+from app.ingestion import LocalFileStorage, chunk_text, extract_text, validate_upload
+from app.models import Base, Document, DocumentChunk, DocumentStatus, User, UserRole
 from app.processing import process_document
 from app.worker import run_once
 
@@ -173,3 +176,94 @@ def test_worker_survives_queue_outages_bad_jobs_and_crashing_jobs(
     monkeypatch.setattr("app.worker.process_document", crash)
     monkeypatch.setattr("app.worker.SessionLocal", lambda: nullcontext(None))
     assert run_once(_OneJobQueue(("queue", str(uuid4()))), settings) is True
+
+
+def _pdf(pages: list[str]) -> bytes:
+    """Build a small text PDF, one string per page."""
+    writer = PdfWriter()
+    font = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Font"),
+                NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/Helvetica"),
+            }
+        )
+    )
+    for text in pages:
+        page = writer.add_blank_page(width=612, height=792)
+        content = DecodedStreamObject()
+        content.set_data(f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode())
+        page[NameObject("/Contents")] = writer._add_object(content)
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})}
+        )
+    buffer = BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def _stored_document(db: Session, file_storage: LocalFileStorage, name: str, data: bytes) -> UUID:
+    owner = User(email="pdf@example.com", password_hash="x", name="P", role=UserRole.VIEWER)
+    db.add(owner)
+    db.commit()
+    document = Document(
+        owner_id=owner.id,
+        filename=name,
+        content_type="application/pdf",
+        file_size=len(data),
+        checksum="0" * 64,
+        storage_key=f"{owner.id}/{name}",
+        status=DocumentStatus.UPLOADED,
+    )
+    db.add(document)
+    db.commit()
+    file_storage.save(document.storage_key, data)
+    return document.id
+
+
+def _memory_session() -> Session:
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+def test_real_pdf_is_extracted_per_page_and_chunked(tmp_path: Path) -> None:
+    data = _pdf(["The VPN uses the corporate identity provider.", "Refunds take 14 days."])
+    assert extract_text(data, ".pdf") == [
+        ("The VPN uses the corporate identity provider.", 1),
+        ("Refunds take 14 days.", 2),
+    ]
+    file_storage = LocalFileStorage(tmp_path)
+    with _memory_session() as db:
+        document_id = _stored_document(db, file_storage, "guide.pdf", data)
+        assert process_document(db, document_id, file_storage=file_storage) is True
+        pages = db.scalars(
+            select(DocumentChunk.page_number).order_by(DocumentChunk.chunk_index)
+        ).all()
+        assert pages == [1, 2]
+
+
+def test_a_parser_that_never_returns_fails_the_document_instead_of_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def hang(*args: object, **kwargs: object) -> None:
+        while True:  # what a crafted PDF does to a vulnerable parser
+            pass
+
+    monkeypatch.setattr("app.processing.extract_text", hang)
+    file_storage = LocalFileStorage(tmp_path)
+    settings = Settings(_env_file=None, document_processing_time_limit_seconds=0.2)
+    with _memory_session() as db:
+        document_id = _stored_document(db, file_storage, "hang.pdf", _pdf(["x"]))
+        started = time.monotonic()
+        assert (
+            process_document(db, document_id, file_storage=file_storage, settings=settings) is False
+        )
+        assert time.monotonic() - started < 5
+        document = db.get(Document, document_id)
+        assert document is not None
+        assert document.status == DocumentStatus.FAILED
+        assert document.error_message == "Document took too long to process"

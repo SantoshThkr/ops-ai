@@ -2,11 +2,12 @@ import hmac
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from fastapi import (
@@ -21,7 +22,10 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from redis import Redis
 from redis.exceptions import RedisError
 from sqlalchemy import func, select
@@ -35,7 +39,7 @@ from app.auth import (
     get_current_user,
     hash_password,
     require_roles,
-    verify_password,
+    verify_password_for,
 )
 from app.chat import stream_reply
 from app.config import get_settings, insecure_settings
@@ -112,13 +116,23 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-app = FastAPI(title="OpsAI API", version=settings.api_version, lifespan=lifespan)
+_PRODUCTION = settings.app_env == "production"
+app = FastAPI(
+    title="OpsAI API",
+    version=settings.api_version,
+    lifespan=lifespan,
+    # The interactive docs and schema describe every endpoint; keep them out of production.
+    docs_url=None if _PRODUCTION else "/docs",
+    redoc_url=None if _PRODUCTION else "/redoc",
+    openapi_url=None if _PRODUCTION else "/openapi.json",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
 )
 
 
@@ -128,6 +142,61 @@ _SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
 }
+if _PRODUCTION:
+    # Production requires HTTPS (secure cookies), so browsers may pin it.
+    _SECURITY_HEADERS["Strict-Transport-Security"] = "max-age=31536000"
+
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_UPLOAD_PATH = "/documents"
+# Multipart framing around the file; JSON bodies are far smaller than this.
+_UPLOAD_OVERHEAD_BYTES = 64 * 1024
+_MAX_JSON_BODY_BYTES = 256 * 1024
+
+
+def _rejection(request: Request) -> JSONResponse | None:
+    """Refuse cross-origin writes and oversized bodies before any handler runs."""
+    if request.method not in _UNSAFE_METHODS:
+        return None
+    # Browsers attach Origin to cross-origin writes. SameSite=Lax cookies stop other
+    # sites, but not other origins on the same site (another localhost port, a sibling
+    # subdomain), and body-less or multipart endpoints need no CORS preflight.
+    origin = request.headers.get("origin")
+    if origin is not None and origin not in settings.cors_origin_list:
+        same_origin = urlsplit(origin).netloc == request.headers.get("host")
+        if not same_origin:
+            log_event(
+                logger,
+                "security.cross_origin_write_blocked",
+                level=logging.WARNING,
+                path=request.url.path,
+                status="blocked",
+            )
+            return JSONResponse({"detail": "Cross-origin request blocked"}, status_code=403)
+    limit = (
+        settings.max_file_size + _UPLOAD_OVERHEAD_BYTES
+        if request.url.path == _UPLOAD_PATH
+        else _MAX_JSON_BODY_BYTES
+    )
+    declared = request.headers.get("content-length")
+    if declared is None:
+        # Without a declared length the body could only be bounded by buffering it.
+        if "chunked" in request.headers.get("transfer-encoding", "").lower():
+            return JSONResponse({"detail": "Content-Length is required"}, status_code=411)
+        return None
+    if not declared.isdigit() or int(declared) > limit:
+        return JSONResponse({"detail": "Request body is too large"}, status_code=413)
+    return None
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_: Request, error: RequestValidationError) -> JSONResponse:
+    # FastAPI's default echoes the rejected value, which would return passwords to the
+    # caller (and to anything logging responses). Report where and why, not what.
+    details = [
+        {"type": item.get("type"), "loc": item.get("loc"), "msg": item.get("msg")}
+        for item in error.errors()
+    ]
+    return JSONResponse(jsonable_encoder({"detail": details}), status_code=422)
 
 
 @app.middleware("http")
@@ -137,7 +206,7 @@ async def request_logging(request: Request, call_next: Any) -> Response:
     token = request_id_context.set(request_id)
     method, path = request.method, request.url.path
     try:
-        response = cast(Response, await call_next(request))
+        response = cast(Response, _rejection(request) or await call_next(request))
     except Exception:
         logger.exception(
             "http.request.failed",
@@ -192,6 +261,21 @@ def _deny_rate_limited(db: Session, scope: str, detail: str) -> HTTPException:
     audit(db, None, "rate_limit.denied", "auth", None, {"scope": scope})
     db.commit()
     return HTTPException(status_code=429, detail=detail)
+
+
+def limited(scope: str, limit: int, window_seconds: int = 60) -> Callable[..., None]:
+    """Dependency: a per-user fixed-window limit for an authenticated endpoint."""
+
+    def dependency(
+        user: CurrentUser,
+        db: Session = Depends(get_db),  # noqa: B008
+    ) -> None:
+        if not check_rate_limit(scope, str(user.id), limit, window_seconds):
+            audit(db, user, "rate_limit.denied", "user", user.id, {"scope": scope})
+            db.commit()
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    return dependency
 
 
 def _conversation_title_from_message(message: str) -> str:
@@ -287,11 +371,10 @@ def login(
         raise _deny_rate_limited(db, "login_ip", "Too many login attempts")
     user = db.scalar(select(User).where(User.email == email))
     password_valid = False
-    if user is not None:
-        try:
-            password_valid = verify_password(credentials.password, user.password_hash)
-        except Exception:
-            log_event(logger, "auth.password_verification_failed", level=logging.WARNING)
+    try:
+        password_valid = verify_password_for(user, credentials.password)
+    except Exception:
+        log_event(logger, "auth.password_verification_failed", level=logging.WARNING)
     if user is None or not password_valid or not user.active:
         audit(db, user, "auth.login_failed", "user", user.id if user else None)
         db.commit()
@@ -339,6 +422,7 @@ def create_conversation(
     payload: ConversationCreate,
     user: CurrentUser,
     db: Session = Depends(get_db),  # noqa: B008
+    _: None = Depends(limited("conversation", 30)),  # noqa: B008
 ) -> Conversation:
     conversation = Conversation(
         user_id=user.id,
@@ -516,6 +600,7 @@ def search_documents(
     request: SearchRequest,
     user: CurrentUser,
     db: Session = Depends(get_db),  # noqa: B008
+    _: None = Depends(limited("search", 60)),  # noqa: B008
 ) -> list[SearchResult]:
     top_k = request.top_k or settings.retrieval_top_k
     return search_owned_chunks(db, user, request.query, top_k, settings)
@@ -526,6 +611,7 @@ def query_metrics(
     request: MetricsQuery,
     user: CurrentUser,
     db: Session = Depends(get_db),  # noqa: B008
+    _: None = Depends(limited("metrics", 120)),  # noqa: B008
 ) -> list[MetricResponse]:
     del user
     from app.tools import get_metric
@@ -569,6 +655,7 @@ def create_incident_proposal(
     payload: IncidentProposalCreate,
     user: User = Depends(require_roles(UserRole.ADMIN, UserRole.ANALYST)),  # noqa: B008
     db: Session = Depends(get_db),  # noqa: B008
+    _: None = Depends(limited("incident_proposal", 30)),  # noqa: B008
 ) -> Incident:
     # Conversation ownership and role checks live in the service so the API, agent,
     # and MCP adapter enforce the same rules.
@@ -672,6 +759,7 @@ def execute(
     user: User = Depends(require_roles(UserRole.ADMIN, UserRole.ANALYST)),  # noqa: B008
     db: Session = Depends(get_db),  # noqa: B008
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),  # noqa: B008
+    _: None = Depends(limited("execution", 30)),  # noqa: B008
 ) -> Action:
     del idempotency_key  # execution is idempotent by persisted status
     action = _require_action(action_id, user, db)
@@ -698,6 +786,7 @@ def mcp(
     request: dict[str, Any],
     user: CurrentUser,
     db: Session = Depends(get_db),  # noqa: B008
+    _: None = Depends(limited("mcp", 60)),  # noqa: B008
 ) -> dict[str, Any]:
     return handle_mcp_request(request, db, user)
 
